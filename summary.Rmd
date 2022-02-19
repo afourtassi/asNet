@@ -1,0 +1,773 @@
+---
+title: "Vocabulary Growth in Children With Autism"
+author: "authors"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(boot)
+library(purrr)
+library(ggplot2)
+library(ggthemes)
+library(feather)
+library(poweRlaw)
+library(wordbankr)
+#library(rwebppl)
+library(lme4)
+library(Hmisc)
+library(qdapRegex)
+library(HDInterval)
+
+```
+
+## Introduction
+
+It is known that children with Autism Spectrum Disorder (ASD) experience a delay in their vocabulary growth compared to Typically Developing children (TD).  In this study, we investigate if the two population vary only in terms of the time it takes them to learn the same words, or whether they also differ in the *way* they learn these words.
+
+Previous studies showed that TD children, on average, tend to learn words based on their salience in the input rather than based on their similarity to previously learned words (Hills et al., 2009; Fourtassi et al., 2018). ASD children may learn differently: Lower attention to social cues may reduce the influence of *external* salience in parent's speech, possibly in favor internal salience, i.e., familiaririty with similar words both at the semantic and phonological level. 
+
+Main findings: We confirm previous findings showing that ASD children experience a significant delay with respect to AD children. We additinally show that both populations follow a similar learning strategy. Analysis of the content of the vocabulary in terms of semanic categories showed that, overall, words were distributed similarly. An exception to this simialrity was the category of people's names which was underrepresented in the vocabulary of ASD children.
+
+## Datasets
+
+From NDAR database.
+
+### Word and Gestures (WG) dataset
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+
+data_AS_WG <- read.delim("mci_words_gestures01.txt", header = TRUE, sep = "\t", dec = ".")
+
+# extracting first row as a descriptive dataframe
+description_WG <- data_AS_WG[1:1,]
+description_WG <- as.data.frame(t(description_WG))
+names(description_WG) <- "description"
+
+# we only kept vocab 
+eliminated_WG <- data_AS_WG%>%
+  select(c(23:58,454:520))
+
+#using mci_words_gestures01_id	as a disctincetive id and The NDAR Global Unique Identifier 
+
+data_raw_AS_WG <- data_AS_WG %>%
+  select(c("mci_words_gestures01_id","subjectkey","interview_age", 59:453))
+
+colnames(data_raw_AS_WG) <- as.character(unlist(data_raw_AS_WG[1,])) #unlist the row
+data_raw_AS_WG = data_raw_AS_WG[-1, ]
+
+# what are the duplicated
+AS_WG_duplicated <- data_raw_AS_WG[duplicated(colnames(data_raw_AS_WG))] # can call colnames 
+
+#feather::write_feather(AS_WG_duplicated, "saved_data/AS_WG_duplicated.feather")
+
+# making column names unique
+names(data_raw_AS_WG) <- make.unique(names(data_raw_AS_WG), sep="_")
+
+
+data_raw_AS_WG<- data_raw_AS_WG %>%
+  rename(id = "mci_words_gestures01_id",
+         GUID = "The NDAR Global Unique Identifier (GUID) for research subject", 
+         age = "Age in months at the time of the interview/test/sampling/imaging.",
+         house = "MacArthur Words and Gestures: Vocabulary Checklist: House")%>%
+  mutate(age = as.numeric(as.character(age)))
+
+data_clean_AS_WG <- data_raw_AS_WG %>%
+  gather(key = "definition", value = "value", -c(id,GUID,age))%>%
+  #separate(definition, c("category","definition"),sep = "\\. ") %>%
+  mutate_all(na_if,"",)%>% #if blank then fill in NA
+   mutate(value = ifelse(value == 0, FALSE, TRUE))
+
+data_median_WG <- data_clean_AS_WG %>%
+  filter(value == TRUE)%>% #keep only  words known at different ages
+  group_by(GUID, age)%>%
+  summarise(n = n_distinct(definition))
+
+data_N_WG <- data_median_WG %>%
+  group_by(age) %>%
+  summarise(N=n())
+
+```
+
+This graph shows the number of words learned as a function of age. Note the sparsity of the sampling: it looks like most data are sampled from only a couple of months.
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+
+ggplot(data_median_WG, aes(x = age, y = n))+
+  geom_point()+
+  geom_smooth()+
+  #geom_smooth(data = data_median_TD_WG, aes(x = age, y = production), color = "darkorange")+
+  theme_few()+
+  xlab("age (months)") + ylab("N words learned")
+
+#Here I should plot the number of children per month 
+
+```
+
+This graph shows the number of children included in each month. It confirms the sparsity issue: most data are indeed sampled from only two months.  
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+
+ggplot(data_N_WG, aes(x = age, y = N))+
+  geom_point()+
+  geom_line()+
+  theme_few()
+
+```
+
+### Word and Sentences (WS) dataset
+
+We plot similar graphs for the WS dataset. We still have sparsity, but several months between 0 and 50 are now well represented. 
+```{r echo = FALSE, warning=FALSE}
+data_AS_WS <- read.delim("mci_sentences02.txt", header = TRUE, sep = "\t", dec = ".")
+
+# extracting first row as a descriptive dataframe
+description_WS <- data_AS_WS[1:1,]
+description_WS <- as.data.frame(t(description_WS))
+names(description_WS) <- "description"
+
+
+# what we get rid of:
+eliminated_WS <- data_AS_WS%>%
+  select(c(701:709,780:850))%>%
+  slice(1:1)%>%
+  gather(key = "Column names", value = "Description")#%>%
+  #head(10)
+
+#feather::write_feather(eliminated_WS,"saved_data/eliminated_WS.feather")
+
+#using mci_sentences02_id	as a disctincetive id and The NDAR Global Unique Identifier 
+data_raw_AS_WS <- data_AS_WS %>%
+  select(c("mci_sentences02_id","subjectkey","interview_age", 21:779)) %>% # starting from 785 is complexity. we kept vocabs, word endings, word forms.
+  select(-(684:692))
+
+colnames(data_raw_AS_WS) <- as.character(unlist(data_raw_AS_WS[1,])) #unlist the row
+data_raw_AS_WS = data_raw_AS_WS[-1, ]
+
+data_raw_AS_WS<- data_raw_AS_WS %>%
+  rename(id = "mci_sentences02_id",
+         GUID = "The NDAR Global Unique Identifier (GUID) for research subject", 
+         age = "Age in months at the time of the interview/test/sampling/imaging.")%>%
+  mutate(age = as.numeric(as.character(age)))
+
+data_clean_AS_WS <- data_raw_AS_WS %>%
+  gather(key = "definition", value = "value", -c(id,GUID,age))%>%
+  separate(definition, c("category","definition"),sep = "\\. ") %>%
+  mutate_all(na_if,"",)%>% #if blank then fill in NA
+   mutate(value = ifelse(value == 0, FALSE, TRUE))
+
+data_median_WS <- data_clean_AS_WS %>%
+  filter(value == TRUE)%>% #keep only  words known at different ages
+  group_by(GUID, age)%>%
+  summarise(n = n_distinct(definition))
+
+data_N_WS <- data_median_WS %>%
+  group_by(age) %>%
+  summarise(N=n())
+
+```
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+
+ggplot(data_median_WS, aes(x = age, y = n))+
+  geom_point()+
+  geom_smooth()+
+  #geom_smooth(data = data_median_TD_WG, aes(x = age, y = production), color = "darkorange")+
+  theme_few()#+
+  #xlim(c(0,50))
+
+#Here I should plot the number of children per month 
+
+ggplot(data_N_WS, aes(x = age, y = N))+
+  geom_point()+
+  geom_line()+
+  theme_few()
+
+
+```
+
+## Trajectory of word learning 
+
+Here I show the learning trajectories of two words "ball" (a noun) and "play" (a verb). Each point is the proportion of AS children that know the word at a given age. Solid lines represent the logistic regression fit. 
+
+For comparison, I also plot (in red) the trajectories for TD children from wordbank.
+
+Note two things:
+
+-Sparsity introduces noise, but the curve is still monotonic as a general trend (although not locally). Compare this to TD curve which is strictly monotonic.
+
+-There is a huge delay in the trajectory of acquisition in AS children: the curve converges to 1 around 100 months of age!
+
+#### The trajectory of the word "ball"
+
+```{r include=FALSE, warning=FALSE}
+
+data_all_AS_WG <- data_clean_AS_WG %>%
+     group_by(definition, age) %>%
+       summarise(num_true = sum(value, na.rm = TRUE),
+                 num_false = n() - num_true,
+                 prop= num_true/n()) %>%
+  ungroup() %>%
+  mutate(form = 'WG')
+
+data_all_AS_WS <- data_clean_AS_WS %>%
+     group_by(category, definition, age) %>%
+       summarise(num_true = sum(value, na.rm = TRUE),
+                 num_false = n() - num_true,
+                 prop = num_true/n()) %>%
+  ungroup() %>%
+  mutate(form = 'WS')
+
+data_all_TD <- feather::read_feather("saved_data/data_all_TD.feather") 
+
+```
+
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+
+glm_fit <- function (dataset) {
+  ages <- min(dataset$age):max(dataset$age)
+  model <- glm(prop ~ age, family = "binomial",
+               data = dataset)
+  fit <- predict(model, newdata = data.frame(age = ages))
+  data.frame(fit, age = ages) %>%
+    mutate(prop = 1/(1 + exp(-fit)))
+}
+
+ball_AS_WG <- data_all_AS_WG %>%
+  filter(definition == "ball") 
+
+ball_AS_WG_mod <- glm_fit(ball_AS_WG) %>%
+  mutate(form = 'WG')
+
+ball_AS_WS <- data_all_AS_WS %>%
+  filter(definition == "ball") %>%
+  select(-category)
+
+ball_AS_WS_mod <- glm_fit(ball_AS_WS) %>%
+  mutate(form = 'WS')
+
+ball_TD_WG <- data_all_TD %>%
+  filter(definition == "ball", 
+         form =="WG")
+
+ball_TD_WG_mod <- glm_fit(ball_TD_WG) %>%
+  mutate(form = 'WG')
+  
+ball_TD_WS <- data_all_TD %>%
+  filter(definition == "ball", 
+         form =="WS")
+
+ball_TD_WS_mod <- glm_fit(ball_TD_WS) %>%
+  mutate(form = 'WS')
+
+ball_TD <- ball_TD_WG %>%
+  bind_rows(ball_TD_WS)  
+
+ball_AS <- ball_AS_WG %>%
+  bind_rows(ball_AS_WS)
+
+ball_AS_mod <- ball_AS_WG_mod %>%
+  bind_rows(ball_AS_WS_mod)
+
+
+ggplot(ball_AS, aes(x = age, y = prop))+
+  geom_point()+
+  geom_line(data= ball_AS_mod)+
+  geom_point(data = ball_TD, col = "red")+
+  geom_line(data = ball_TD, col = "red")+
+  geom_hline(yintercept=.5, linetype="dashed", color = "blue")+
+  facet_grid(.~form) +
+  theme_few()
+
+```
+
+#### The trajectory of the word "paly"
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+play_AS_WG <- data_all_AS_WG %>%
+  filter(definition == "play")
+
+play_AS_WG_mod <- glm_fit(play_AS_WG) %>%
+  mutate(form = 'WG')
+
+play_AS_WS <- data_all_AS_WS %>%
+  filter(definition == "play") %>%
+  select(-category)
+
+play_AS_WS_mod <- glm_fit(play_AS_WS) %>%
+  mutate(form = 'WS')
+
+play_AS <- play_AS_WG %>%
+  bind_rows(play_AS_WS)
+
+play_AS_mod <- play_AS_WG_mod %>%
+  bind_rows(play_AS_WS_mod)
+
+play_TD_WG <- data_all_TD %>%
+  filter(definition == "play", form == "WG")
+
+play_TD_WG_mod <- glm_fit(play_TD_WG) %>%
+  mutate(form = 'WG')
+
+play_TD_WS <- data_all_TD %>%
+  filter(definition == "play", form == "WS")
+
+play_TD_WS_mod <- glm_fit(play_TD_WS) %>%
+  mutate(form = 'WS')
+
+play_TD <- play_TD_WG %>%
+  bind_rows(play_TD_WS)
+
+play_TD_mod <- play_TD_WG_mod %>%
+  bind_rows(play_TD_WS_mod)
+
+
+ggplot(play_AS, aes(x = age, y = prop))+
+  geom_point()+
+  geom_line(data= play_AS_mod)+
+  geom_point(data = play_TD, col = "red")+
+  geom_line(data= play_TD_mod, col = "red") +
+  geom_hline(yintercept=.5, linetype="dashed", color = "blue")+
+  facet_grid(.~form)+
+  theme_few()
+
+
+
+```
+
+#### The age of acquisition 
+
+For each word in the dataset, we define the age of acquisition as the month at which the logistic curve crosses 0.5. Here I plot the density distribution of AoAs in both WG (dotted) and WS (solid) datasets, for both AS and TP children (colors). 
+
+One surprising thing about these data is the fact that AS children learn words earlier in WS than they do in the WG dataset (the opposite of the pattern obtained with TD children). That said, keep in mind that the AoA in WG may not be as reliable as WS due to the sparsity issue.
+
+
+```{r include=FALSE, warning=FALSE}
+data_aoa_AS_WG <- feather::read_feather("saved_data/data_aoa_AS_WG.feather") 
+
+data_aoa_TD <- feather::read_feather("saved_data/data_aoa_TD.feather")%>%
+  filter(measure == "understands")
+
+#This removes parentheses
+data_aoa_TD$definition = rm_between(data_aoa_TD$definition,'(', ')',extract = F, clean = T)
+
+#This remove the instances of "*" (what does that mean?)
+data_aoa_TD$definition <- gsub("*", "", data_aoa_TD$definition, fixed = TRUE)
+
+#This returns the overlap between TD and AS
+all_aoa_WG <- inner_join(data_aoa_TD,data_aoa_AS_WG, by = "definition")%>%
+  rename(TD = aoa,
+         AS = aoa_AS)%>%
+  filter(TD > 5) %>% #to clean aberrant aoa, but the threshold is kinda arbitraty
+  gather(condition, aoa, TD, AS)
+  
+#this return the lost data 
+No_match_AS_WG <- anti_join(data_aoa_TD,data_aoa_AS_WG, by = "definition")#%>%
+  #head(10)
+
+```
+
+
+```{r include=FALSE, warning=FALSE}
+
+data_aoa_AS_WS <- feather::read_feather("saved_data/data_aoa_AS_WS.feather")
+
+data_aoa_TD <- feather::read_feather("saved_data/data_aoa_TD.feather")%>%
+  filter(measure == "produces")
+
+data_aoa_TD$uni_lemma = rm_between(data_aoa_TD$uni_lemma,'(', ')',extract = F, clean = T)
+
+# decided using uni_lemma, uni_lemma does not have *, however, sometimes it has ()that gave further definition which could be interesting for matching 
+
+#which(!data_aoa_TD$uni_lemma == data_aoa_TD$definition)
+
+all_aoa_WS <- inner_join(data_aoa_TD,data_aoa_AS_WS, by = c("uni_lemma" = "definition"))%>%
+  rename(TD = aoa,
+         AS = aoa_AS)%>%
+  filter(TD > 5) %>%
+  gather(condition, aoa, TD, AS)
+ 
+No_match_AS_WS <- anti_join(data_aoa_TD,data_aoa_AS_WS, by = c("uni_lemma" = "definition"))#%>%
+  #head(10)
+```
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+
+ggplot(all_aoa_WS, aes(aoa, col=condition))+
+  geom_density()+
+  geom_density(data= all_aoa_WG, linetype=2) +
+  theme_few()+
+  xlab("AoA (in months)")
+
+```
+
+## lexical network analysis
+
+Here we used the data to construct semantic and phonological networks following the method outlined in Fourtassi, Bian, and Frank (in press).  
+
+Nodes in the network represent words and the edges between the nodes represent semantic or phonological relationship between pairs of words. 
+
+For the semantic networks, we used the cue-target relationships in the Florida free association norms. For the phonological relations, we used edit distance computed over the phonological transcription of the words.
+
+We started with exploring the "static" properties of the full, end-state network (constructed using the entire set of words) and then we studied the mechanism of growth. 
+
+All analyses involved the measure of "degree." The degree is defined, for a given word, as the number of other words to which it is related.
+
+First, we sought to replicate with ASD children two important findings obtained previously only with TD children: 1) the degree of a word in the end-state network predicts its AoA and 2) the degree distirution of the end-state network follows a power-law.  Second, we investigated whether the mechanism of growth is driven more by the structure of previous word knowledege or whether it is influenced by salience in the speech input regardless of the children's previous knowledge.
+
+### Degree vs. Age of acquisition
+
+```{r include=FALSE}
+
+data_growth_AS_WG <- feather::read_feather("saved_data/data_growth_AS_WG.feather") 
+```
+
+```{r include=FALSE, warning=FALSE}
+words_growth <- data_growth_AS_WG
+
+sem_red <- feather::read_feather("saved_data/sem_red_AS_WG.feather") 
+
+phono_red <- feather::read_feather("saved_data/phono_red_AS_WG.feather") 
+
+#Combine data 
+data_growth_net <- words_growth %>%
+  left_join(sem_red) %>%
+  left_join(phono_red)
+
+#feather::write_feather(data_growth_net, "saved_data/data_growth_net_AS_WG.feather")
+```
+
+```{r, include=FALSE, warning=FALSE}
+#Compute other static predictors (frequency and length) besides PAC
+
+data_static_pred_AS_WG <- feather::read_feather("saved_data/data_static_pred_AS_WG.feather") 
+
+#Combine with full proportion-based data  (for the second regression which fit the entire production curve)
+data_static_pred_AS_WG$language <- plyr::mapvalues(data_static_pred_AS_WG$language, 
+                                 from = "English (American)", 
+                                 to = "English")
+
+
+```
+
+Here I plot the relationship between the degree z-score and the corresponding AoA for both WG (described as "understands") and WS ("produces") in AS children.
+
+We find there to be a correlation between the degree and AoA. The words with the most connections in both semantic and phonological networks tend to be learned earlier.
+
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+
+#feather::write_feather(uni_scale, "saved_data/uni_scale_AS_WG.feather")
+
+uni_scale_AS <- feather::read_feather("saved_data/uni_scale_AS_WG.feather") %>%
+  bind_rows(feather::read_feather("saved_data/uni_scale_AS_WS.feather")) %>%
+  mutate(condition = "AS")
+
+uni_scale_TD <- feather::read_feather("saved_data/uni_scale_TD.feather") %>%
+  mutate(condition = "TD") 
+
+uni_scale <- uni_scale_TD %>%
+  bind_rows(uni_scale_AS) %>%
+  gather(predictor, value, sem_deg:frequency) %>%
+  filter(predictor == "sem_deg" | predictor == "phono_deg") 
+
+
+correlations <- uni_scale %>%
+  group_by(measure, condition, predictor) %>%
+  summarise(cor = round(cor(aoa, value), 2))
+
+plot_correlation_AS <- ggplot(data = subset(uni_scale, condition == "AS"), aes(x=value, y=aoa))+
+  facet_grid(measure ~ predictor)+
+  geom_jitter(size = 0.9,col = "lightblue")+
+  geom_abline(slope = -1)+
+  coord_cartesian(xlim=c(-1,5))+
+  #scale_x_continuous(limits=c(-2,5))+
+  #scale_y_continuous(breaks =c(55,85,115,145))+
+  geom_smooth(method = "lm", colour = "grey1", se=FALSE)+
+  #scale_colour_solarized(name = "") +
+  theme_few()+
+  theme(aspect.ratio = 0.7, 
+        plot.margin=grid::unit(c(0,0,0,0), "mm")
+        )+
+  geom_text(data=subset(correlations, condition == "AS"), aes(label=paste("r=", cor, sep="")), x=3.5, y=100, size=4, fontface = "bold")+
+  xlab("degree z-score") +ylab("AoA")
+  
+plot_correlation_AS
+
+```
+
+For comparison, I show below the equivalent plots for TD children.
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+plot_correlation_TD <- ggplot(data = subset(uni_scale, condition == "TD"), aes(x=value, y=aoa))+
+  facet_grid(measure ~ predictor)+
+  geom_jitter(size = 0.9,col = "lightblue")+
+  geom_abline(slope = -1)+
+  coord_cartesian(xlim=c(-1,5))+
+  #scale_x_continuous(limits=c(-2,5))+
+  #scale_y_continuous(breaks =c(55,85,115,145))+
+  geom_smooth(method = "lm", colour = "grey1", se=FALSE)+
+  #scale_colour_solarized(name = "") +
+  theme_few()+
+  theme(aspect.ratio = 0.7, 
+        plot.margin=grid::unit(c(0,0,0,0), "mm")
+        )+
+  geom_text(data=subset(correlations, condition == "TD"), aes(label=paste("r=", cor, sep="")), x=3.5, y=30, size=4, fontface = "bold")+
+  xlab("degree z-score") +ylab("AoA")
+  
+plot_correlation_TD
+```
+
+### Degree distribution
+ 
+Here we examine whether the degree distribution in the semantic and phonological networks follows a power-law. This examination can be crucial to the mechanism of growth. In particular, the absence of a power-law rules out the rich-get-richer growth mechanism 
+
+I show a log-log plot of the degree distribution. A power-law should appear as a straight line in such a graph. For comparison, I plot the TD data next to AS data.
+
+Results: AS data are very similar to TD data and, overall, tend to approximate a power-law distribution (after a certain cut-off).
+
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+
+#Data for plot
+
+degree_dist_WG <- feather::read_feather("saved_data/degree_dist_AS_WG.feather") %>%
+  mutate(condition = 'AS')
+
+degree_dist_WS <- feather::read_feather("saved_data/degree_dist_AS_WS.feather") %>%
+  mutate(condition = 'AS')
+
+degree_dist_TD <- feather::read_feather("saved_data/degree_dist.feather") %>%
+  mutate(condition = 'TD') %>%
+  filter(language == "English")
+
+degree_dist <- degree_dist_WG %>%
+  bind_rows(degree_dist_WS) %>%
+  bind_rows(degree_dist_TD)
+
+
+#plot cumulative distributions
+ggplot(data = degree_dist, aes(x=x, y=y, col=dimension))+
+  facet_grid(measure ~ condition)+
+  geom_point() +
+  scale_y_log10() + scale_x_log10() +
+  labs(x = "degree", y = "probability")+
+  theme(aspect.ratio = 1) +
+  theme_few()
+
+```
+
+ 
+### Mechanism of growth
+
+
+We compare two mechanisms of growth. Given a known lexical network at time *t*, the word that will be learned at time *t+1* can be chosen based on the structure of the existing knowledge (Internal criterion) and/or on the structure of the input (External criterion).
+
+A well-studied example of the internal criterion is based on the rich-get-richer principle: learners select the word that would connect to a word with a high degree in the known (and yet incomplete) network. An instance of the external criterion is based on salience in the input: learners select a word with a high degree in the global input network.
+
+Previous studies (Hills et al., 2009; Fourtassi et al. 2018) explored these mechanisms in TD children and found that, on average, children tend to learn based on the external criterion.  What about ASD children?
+
+
+#### Models for AS children
+
+For details of how we modeled the Internal and External mechanisms, see Fourtassi et al. (in press). In brief, we ran a model that is equivalent to a regression in that it fits parameters that characterize some predictors. The set of predictors includes the two learning mechanisms (INT and EXT) used with different information (phonological and semantic). We end-up with 4 predictors: SemINT, SemEXT, phonoINT, and phonoEXT.
+
+The model was trained on the real trajectory of word learning (using AoAs).
+
+If the predictor is different from 0, it means the corresponding mechanism contributes to predicting word learning.
+
+As we see below, ASD children follow the external criterion (similar to TD).
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+
+posterior_as_ws <- feather::read_feather("saved_data/posterior_as_ws.feather")
+posterior_as_wg <- feather::read_feather("saved_data/posterior_as_wg.feather")
+
+posterior_td <- feather::read_feather("saved_data/posterior.feather") %>%
+  filter(language == "English")
+
+
+param_wg <- posterior_as_wg %>%
+  select(starts_with("value.parameters"), measure, language, model_name) %>%
+  gather(alpha, value, value.parameters.alpha1:value.parameters.alpha6) %>%
+  mutate(alpha = gsub("value.parameters.", "", alpha)) %>%
+  dplyr::filter(alpha != "alpha5",
+         alpha != "alpha6") %>%
+  rename(model = model_name) %>%
+  mutate(condition = 'AS')
+
+param_ws <- posterior_as_ws %>%
+  select(starts_with("value.parameters"), measure, language, model_name) %>%
+  gather(alpha, value, value.parameters.alpha1:value.parameters.alpha6) %>%
+  mutate(alpha = gsub("value.parameters.", "", alpha)) %>%
+  dplyr::filter(alpha != "alpha5",
+         alpha != "alpha6") %>%
+  rename(model = model_name) %>%
+  mutate(condition = 'AS')
+
+param_td <- posterior_td %>%
+  select(starts_with("value.parameters"), measure, language, model_name) %>%
+  gather(alpha, value, value.parameters.alpha1:value.parameters.alpha6) %>%
+  mutate(alpha = gsub("value.parameters.", "", alpha)) %>%
+  dplyr::filter(alpha != "alpha5",
+         alpha != "alpha6") %>%
+  rename(model = model_name) %>%
+  mutate(condition = 'TD')
+
+
+param <- param_wg %>%
+  bind_rows(param_ws) %>%
+  bind_rows(param_td)
+
+param_summary <- param %>%
+  group_by(measure, language, condition, model, alpha) %>%
+  summarise(mean = mean(value),
+            median = median(value),
+            quantile_lower = quantile(value, c(0.025, 0.975))["2.5%"],
+            quantile_upper = quantile(value, c(0.025, 0.975))["97.5%"],
+            hdi_lower = hdi(value)['lower'],
+            hdi_upper = hdi(value)['upper']
+  )
+
+
+param_summary_ind <- param_summary %>%
+  dplyr::filter(model != "model_semPAC_phonoPAC_semPAT_phonoPAT",
+         alpha == "alpha1") %>%
+  mutate(Test = 'Individual') %>%
+  select(-alpha)
+
+param_summary_ind$model <- plyr::mapvalues(param_summary_ind$model, 
+                                 from = c("semPAC", "phonoPAC","semPAT","phonoPAT"), 
+                                 to = c("semEXT", "phonoEXT", "semINT", "phonoINT"))
+
+param_summary_com <- param_summary %>%
+  ungroup() %>%
+  dplyr::filter(model == "model_semPAC_phonoPAC_semPAT_phonoPAT") %>%
+  select(-model) %>%
+  rename(model = alpha) %>%
+  mutate(Test = 'Combined')
+
+param_summary_com$model <- plyr::mapvalues(param_summary_com$model, 
+                                 from = c("alpha1", "alpha2","alpha3","alpha4"), 
+                                 to = c("semEXT", "phonoEXT", "semINT", "phonoINT"))
+
+param_summary_all <- param_summary_ind %>%
+  bind_rows(param_summary_com)
+
+
+ggplot(subset(param_summary_all, condition =="AS" & Test =="Individual"), aes(x = model , y = mean)) +
+  geom_pointrange(aes(ymin = hdi_lower, ymax = hdi_upper, col = Test),
+                  position = position_dodge(width = .5),
+                  size = 0.5,
+                  fatten = 0.5)+
+  geom_hline(yintercept = 0, color = "grey", linetype = "dashed")+
+  coord_flip() +
+  facet_grid(. ~ measure) +
+  guides(colour=FALSE, linetype = guide_legend(override.aes = list(size=0.3)))+
+  scale_colour_solarized() +
+  theme_bw()+
+  theme(aspect.ratio = 0.7)
+
+```
+
+#### Models for TD children
+
+For comparison, I reproduced the results obtained with TD children.
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+
+ggplot(subset(param_summary_all, condition =="TD" & Test =="Individual"), aes(x = model , y = mean)) +
+  geom_pointrange(aes(ymin = hdi_lower, ymax = hdi_upper, col = Test),
+                  position = position_dodge(width = .5),
+                  size = 0.5,
+                  fatten = 0.5)+
+  geom_hline(yintercept = 0, color = "grey", linetype = "dashed")+
+  coord_flip() +
+  facet_grid(. ~ measure) +
+  guides(colour=FALSE, linetype = guide_legend(override.aes = list(size=0.3)))+
+  scale_colour_solarized() +
+  theme_bw()+
+  theme(aspect.ratio = 0.7)
+
+```
+
+### Comparison to other predictors of word learning
+
+We explore if the EXT mechanism predicts word learning when controlling for word frequency and length.
+
+The results, below, show that this mechanism remains predictive (except the for semantics in the WG data).
+
+```{r include=FALSE, warning=FALSE}
+
+coefs_AS_WG <- feather::read_feather("saved_data/static_preds_AS_WG.feather") %>%
+  mutate(condition = "AS")
+
+coefs_AS_WS <- feather::read_feather("saved_data/static_preds_AS_WS.feather") %>%
+  mutate(condition = "AS")
+
+coefs_TD <- feather::read_feather("saved_data/static_preds.feather") %>% 
+  filter(language == "English") %>%
+  mutate(condition = "TD")
+
+coefs_all <- coefs_AS_WG %>%
+  bind_rows(coefs_AS_WS) %>%
+  bind_rows(coefs_TD)
+
+```
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+
+plot_reg_AS <- ggplot(subset(coefs_all, condition == "AS"), aes(x = predictor, y = estimate)) +
+  geom_pointrange(aes(ymin = X2.5.., ymax = X97.5.., y = estimate, col = predictor, linetype=Test),
+                  position = position_dodge(width = .5),
+                  size = 0.5,
+                  fatten = 0.5)+
+                  
+  geom_hline(yintercept = 0, color = "grey", linetype = "dashed")+
+  #facet_wrap(~language, ncol=4)  +
+  coord_flip() +
+  guides(colour=FALSE)+
+  scale_colour_solarized() +
+  theme_few()+
+  theme(aspect.ratio = 0.7) +
+  facet_grid(. ~ measure)  
+ 
+plot_reg_AS
+
+```
+
+Here I plot the results of TD children for comparison.
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+plot_reg_TD <- ggplot(subset(coefs_all, condition == "TD"), aes(x = predictor, y = estimate)) +
+  geom_pointrange(aes(ymin = X2.5.., ymax = X97.5.., y = estimate, col = predictor, linetype=Test),
+                  position = position_dodge(width = .5),
+                  size = 0.5,
+                  fatten = 0.5)+
+                  
+  geom_hline(yintercept = 0, color = "grey", linetype = "dashed")+
+  #facet_wrap(~language, ncol=4)  +
+  coord_flip() +
+  guides(colour=FALSE)+
+  scale_colour_solarized() +
+  theme_few()+
+  theme(aspect.ratio = 0.7) +
+  facet_grid(. ~ measure)  
+ 
+plot_reg_TD
+```
+
+
+
+## Vocabulary composition
+
+
+Here the grpah
+
+## Appendix 
+
+Here I show the data for WG. The sparisity of the data makes the results noisier, but the trends are generally similar to those found with WS.
+
+
+
