@@ -5,10 +5,11 @@ date: '2022-07-19'
 output: html_document
 ---
 
-```{r, echo=F}
+```{r, echo=F, message=F}
+require("tidyverse")
 require("gamlss")
 
-load("data/cached_data.Rds")
+load("data/nda_private/cached_data.Rds") # from 01_prep_data.Rmd
 ```
 
 
@@ -25,7 +26,7 @@ demo_asd <- d_asd_ws %>% rename(data_id=id) %>%
   mutate(data_id = as.numeric(data_id),
          group = "ASD") %>%
   group_by(data_id, age, group) %>%
-  summarise(production = sum(value, na.rm=T)) 
+  summarise(production = sum(value, na.rm=T), .groups = "drop")
 
 demo_td <- demo_td %>% mutate(prop_produced = production / 680) %>%
    mutate(prop_produced = case_when(prop_produced == 0 ~ 0.001,

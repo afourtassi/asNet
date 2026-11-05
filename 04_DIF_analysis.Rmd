@@ -1,302 +1,169 @@
 ---
 title: "DIF analysis"
 author: "ASD CDI team"
-date: '2022-07-19'
+date: '2026-11-05'
 output: html_document
+params:
+  tier_A_only: false   # sensitivity check: only collections with trust tier A
+  refit: false         # refit IRT models even if a cached fit exists
 ---
 
-
-## DIF Analysis for WS data
-
-```{r}
-
-wb_items = d_td_ws %>% 
-  distinct(category, definition)
-
-asd_items = data_clean_AS_WS %>% 
-  distinct(category, definition)
-
-td_mat <- d_td_ws %>% dplyr::select(data_id, definition, produces) %>% 
-  pivot_wider(id_cols = data_id, names_from = definition, values_from = produces)
-  
-
-asd_mat <- data_clean_AS_WS %>% rename(data_id=id) %>%
-  filter(!is.element(dataset_id, bad_ws_datasets)) %>%
-  dplyr::select(data_id, definition, value) %>% 
-  pivot_wider(id_cols = data_id, names_from = definition, values_from = value)
-
-demo_td <- d_td_ws %>% 
-  distinct(data_id, age, production, sex, ethnicity, mom_ed) %>% 
-  mutate(group = "TD")
-
-demo_asd <- data_clean_AS_WS %>% rename(data_id=id) %>%
-  filter(!is.element(dataset_id, bad_ws_datasets)) %>%
-  mutate(data_id = as.numeric(data_id),
-         group = "ASD") %>%
-  group_by(data_id, age, group) %>%
-  summarise(production = sum(value, na.rm=T)) 
-```
-
-
-```{r, echo=F, message=F, warning=F}
-
-#cor.test(demo_asd$age, demo_asd$production) # .40
-#cor.test(demo_td$age, demo_td$production) # .75
-
-# no overlap in data_ids, right?
-#intersect(demo_td$data_id, demo_asd$data_id) # 0 - good
-
-bad_Ss_td = demo_td[which(demo_td$production==0),]$data_id 
-bad_Ss_asd = demo_asd[which(demo_asd$production==0),]$data_id 
-
-# combine data
-d_mat <- rbind(td_mat, asd_mat) %>% filter(!is.element(data_id, c(bad_Ss_asd, bad_Ss_td)))
-d_demo <- demo_td %>% dplyr::select(data_id, age, group, production) %>% 
-  bind_rows(demo_asd) %>%
-  filter(!is.element(data_id, c(bad_Ss_asd, bad_Ss_td)))
-
-sids = d_mat$data_id
-d_mat$data_id = NULL
-d_mat = data.matrix(d_mat)
-row.names(d_mat) = sids
-
-d_group = as.character(d_demo$group)
-
+```{r setup, message=F, warning=F}
+library(tidyverse)
+library(knitr)
+library(mirt)
+library(gamlss)
 source("helper_functions/DIF_helpers.R")
+knitr::opts_chunk$set(message = F, warning = F)
 
+load("data/nda_private/cached_data.Rds") # from 01_prep_data.Rmd
 
+# IRT assumes independent respondents, so use one administration per ASD child
+# (chosen at random in 01_prep_data.Rmd; NDAR includes longitudinal data).
+asd_keep <- function(d) {
+  d <- d %>% filter(one_per_child)
+  if (params$tier_A_only) d <- d %>% filter(tier == "A")
+  d
+}
+suffix <- if (params$tier_A_only) "_tierA" else ""
+model_path <- function(form) sprintf("data/nda_private/prod%s_IRT_model%s.Rds", form, suffix)
+
+# Build TD + ASD response matrix (same item order), dropping children who produce 0 words
+build_dif_data <- function(td, asd) {
+  items <- sort(unique(td$definition))
+  stopifnot(setequal(items, unique(asd$definition)))
+  td_mat <- td %>% transmute(sid = paste0("td_", data_id), definition, value = produces) %>%
+    pivot_wider(id_cols = sid, names_from = definition, values_from = value)
+  asd_mat <- asd %>% transmute(sid = paste0("asd_", id), definition, value) %>%
+    pivot_wider(id_cols = sid, names_from = definition, values_from = value)
+  mat <- bind_rows(td_mat, asd_mat)
+  demo <- tibble(sid = mat$sid, group = ifelse(startsWith(mat$sid, "td_"), "TD", "ASD"),
+                 production = rowSums(select(mat, all_of(items)), na.rm = T))
+  keep <- demo$production > 0
+  m <- data.matrix(mat[keep, items]); rownames(m) <- mat$sid[keep]
+  list(mat = m, group = demo$group[keep], removed = count(demo[!keep, ], group))
+}
+
+fit_or_load <- function(dd, path) {
+  if (params$refit || !file.exists(path)) {
+    mod_dev_group <- fit_mod_intuitive(dd$mat, dd$group)
+    save(mod_dev_group, file = path)
+  }
+  load(path)
+  mod_dev_group
+}
+
+# Production percentiles by age (GAMLSS, beta family)
+centile_plot <- function(demo_td, demo_asd, n_items, td_ages, asd_ages) {
+  prep <- function(d) d %>% mutate(prop_produced = pmin(pmax(production / n_items, 0.001), 0.999))
+  fit <- function(d) gamlss(prop_produced ~ pbm(age, lambda = 10000),
+                            sigma.formula = ~ pbm(age, lambda = 10000),
+                            family = BE, data = d, trace = F)
+  # gamlss re-reads the fitting data by name when predicting, so pass it explicitly
+  cents <- function(d, ages) centiles.pred(fit(d), cent = c(90, 75, 50, 25, 10),
+                                           xname = "age", xvalues = ages, data = d, plot = F) %>%
+    tibble() %>% pivot_longer(2:6, names_to = "percentile", values_to = "pred") %>% rename(age = x)
+  demo_td <- prep(demo_td); demo_asd <- prep(demo_asd)
+  ct <- cents(demo_td, td_ages); ca <- cents(demo_asd, asd_ages)
+  p <- function(d, cc, title) ggplot(d, aes(x = jitter(age))) +
+    geom_point(alpha = .1, aes(y = production)) +
+    geom_line(data = cc, aes(x = age, y = pred * n_items, linetype = percentile)) +
+    theme_classic() + xlab("Age (months)") + ylab("Production Sumscore") + ggtitle(title)
+  ggpubr::ggarrange(p(demo_td, ct, "Typically-Developing"), p(demo_asd, ca, "ASD"),
+                    ncol = 2, common.legend = T)
+}
 ```
 
-`r length(bad_Ss_td)` typically-developing (TD) children were removed from the wordbank data (`r nrow(demo_td)` total) due to their not yet producing any words.
-`r length(bad_Ss_asd)` children with ASD were removed from the NDAR data (`r nrow(demo_asd)` total) due to their not yet producing any words.
+`r if (params$tier_A_only) "**Sensitivity analysis: tier-A collections only.**"`
 
+# CDI:WS Production
 
-```{r fit-ws-model, eval=F}
-mod_dev_group <- fit_mod_intuitive(d_mat, d_group)
-
-save(mod_dev_group, file="data/prodWS_IRT_model.Rds")
+```{r ws-data}
+wb_items <- d_td_ws %>% distinct(category, definition)
+asd_ws <- asd_keep(d_asd_ws)
+dd_ws <- build_dif_data(d_td_ws, asd_ws)
 ```
 
-```{r load-ws-model}
-load("data/prodWS_IRT_model.Rds") # 12-48 mos ASD
-#plot_glimmer(mod_dev_group, colnames(d_mat), colnames(d_mat), 
-#             plotName="GLIMMER_asd_prodWS_age12-48mos")
+The ASD sample has `r n_distinct(asd_ws$GUID)` children from `r n_distinct(asd_ws$collection_id)` collections, one administration per child.
+Children producing no words were removed: `r paste(dd_ws$removed$n, dd_ws$removed$group, collapse = ", ")`.
 
-#load("data/prodWS_IRT_model_16-48mos.Rds")
-#plot_glimmer(mod_dev_group, colnames(d_mat), colnames(d_mat), 
-#             plotName="GLIMMER_asd_prodWS_age16-48mos")
-# doesn't make a difference whether we exclude 12-15 month-old ASD kids or not
-
-
-mm_asd <- extract_group_df(mod_dev_group, groups=c("TD","ASD"))
-#dif_hist <- item_difficulty_difference_histogram(mm_asd)
-
-thresh = median(mm_asd$d_diff_abs) + 2*sd(mm_asd$d_diff_abs)
-big_dif = mm_asd[which(mm_asd$d_diff_abs > thresh),]
-
-dif_histn <- item_difficulty_difference_histogram(mm_asd, withNormal = T)
-print(dif_histn)
+```{r ws-centiles, fig.width=9, fig.height=4, fig.cap="Production sumscores on the CDI:WS for TD vs. ASD children."}
+demo_td_ws <- d_td_ws %>% distinct(data_id, age, production)
+demo_asd_ws <- asd_ws %>% group_by(id, age) %>% summarise(production = sum(value, na.rm = T), .groups = "drop")
+centile_plot(demo_td_ws, demo_asd_ws, 680, 16:30, 12:48)
 ```
 
-The majority of items are easier for TD than for ASD children. 
-We examine the extrema: items with an absolute difficulty difference of at least 2 standard deviations (|d_diff| = `r round(thresh,2)`; red dotted lines in histogram).
-These `r nrow(big_dif)` extrema are listed below.
+```{r fit-ws-model}
+mod_ws <- fit_or_load(dd_ws, model_path("WS"))
+
+mm_asd <- extract_group_df(mod_ws, groups = c("TD", "ASD"))
+thresh <- median(mm_asd$d_diff_abs) + 2 * sd(mm_asd$d_diff_abs)
+big_dif <- mm_asd[which(mm_asd$d_diff_abs > thresh), ]
+
+print(item_difficulty_difference_histogram(mm_asd, withNormal = T))
+```
+
+We examine the extrema: items with an absolute difficulty difference at least 2 SD above the median (|d_diff| > `r round(thresh,2)`; red dotted lines in the histogram).
+There are `r nrow(big_dif)` such items:
 
 ```{r}
-big_dif <- big_dif %>% left_join(wb_items)
+big_dif <- big_dif %>% left_join(wb_items, by = "definition")
 
-big_dif %>% arrange(d_diff) %>% 
+big_dif %>% arrange(d_diff) %>%
   relocate(category, definition) %>%
-  rename(d_TD=d_g1, d_ASD=d_g2) %>%
+  rename(d_TD = d_g1, d_ASD = d_g2) %>%
   dplyr::select(-a1, -group1, -group2) %>%
-  kable(format = "html", table.attr = "style='width:50%;'", digits=2)
+  kable(format = "html", table.attr = "style='width:50%;'", digits = 2)
+
+sort(table(big_dif$category)) %>% kable(col.names = c("Category", "Frequency"))
 ```
-
-```{r}
-sort(table(big_dif$category)) %>% kable(col.names=c("Category","Frequency"))
-```
-
-Mostly people and action words.
-
-## Ability vs. Sumscore by Age
-
-```{r, eval=F, echo=F}
-d_demo <- d_demo %>% 
-  left_join(tibble(data_id = rownames(d_mat), 
-                   ability = fscores(mod_dev_group, method = "MAP")[,1]))
-# MAP: Warning: The following factor score estimates failed to converge successfully:
-#  2448,2750
-```
-
 
 
 # CDI:WG Production
 
-### Examine ASD WG datasets
-
-```{r}
-data_clean_AS_WG %>% group_by(id, age, sex, dataset_id) %>%
-  summarise(comprehension = sum(value, na.rm=T)) %>%
-  group_by(dataset_id) %>%
-  summarise(min_age = min(age), max_age = max(age), mean_age = mean(age),
-            n = n(), mean_comp = mean(comprehension)) %>%
-  arrange(desc(n)) %>%
-  kable(format = "html", table.attr = "style='width:50%;'", digits=1)
-```
-
-Datasets with all 0 comprehension scores: c(12095, 9138, 10754, 11574, 8703, 8667, 18066, 14458, 17999, 12942, 11717, 8368, 17935, 8176, 8370, 8535, 9507, 12891, 12820, 12790, 8532, 8912, 8922)
-10754 and 11574 have identical age ranges, mean ages, and Ns, as do 8176 and 8370.
-16641 and 14747 have identical age ranges, mean ages, Ns, and average comprehension scores.
-After removing all of the 0-comprehension datasets, there are only 3829 participants.
-
-```{r}
-bad_asd_wg_datasets = c(12095, 9138, 10754, 11574, 8703, 8667, 18066, 14458, 17999, 12942, 11717, 8368, 17935, 8176, 8370, 8535, 9507, 12891, 12820, 12790, 8532, 8912, 8922)
-data_clean_AS_WG <- data_clean_AS_WG %>% filter(!is.element(dataset_id, bad_asd_wg_datasets))
-```
-
-
-```{r, echo=F}
+```{r wg-data}
 base::load("data/eng_wg_raw_data.Rds")
 
-d_wg <- eng_wg %>%
+d_td_wg <- eng_wg %>%
   mutate(produces = value == "produces") %>%
-  filter(!is.na(category)) %>% 
-  dplyr::select(data_id, produces, age, production, sex, ethnicity, mom_ed, category, definition) %>%
-  mutate(form="WG")
+  filter(!is.na(category)) %>%
+  dplyr::select(data_id, produces, age, production, category, definition)
 
-wg_items = d_wg %>% distinct(category, definition)
-
-asd_items = data_clean_AS_WG %>% distinct(definition) # category not present
-
-# match ASD and wordbank defs:
-#intersect(wg_items$definition, asd_items$definition) # 396/396
-#sort(setdiff(wg_items$definition, asd_items$definition))
-#sort(setdiff(asd_items$definition, wg_items$definition)) 
-
-td_mat_wg <- d_wg %>% dplyr::select(data_id, definition, produces) %>% 
-  pivot_wider(id_cols = data_id, names_from = definition, values_from = produces)
-  
-
-asd_mat_wg <- data_clean_AS_WG %>% rename(data_id=id) %>%
-  dplyr::select(data_id, definition, value) %>% 
-  pivot_wider(id_cols = data_id, names_from = definition, values_from = value) %>%
-  relocate("throw", .after="take")
-
-# same order?
-# names(td_mat_wg)==names(asd_mat_wg)
-
-demo_td_wg <- d_wg %>% distinct(data_id, age, production, sex, ethnicity, mom_ed) %>% 
-  mutate(group = "TD")
-demo_asd_wg <- data_clean_AS_WG %>% rename(data_id=id) %>%
-  mutate(data_id = as.numeric(data_id),
-         group = "ASD") %>%
-  group_by(data_id, age, group) %>%
-  summarise(production = sum(value, na.rm=T)) 
-
-
-# no overlap in data_ids, right?
-#intersect(demo_td_wg$data_id, demo_asd_wg$data_id) # 0 - good
-
-bad_Ss_td = demo_td_wg[which(demo_td_wg$production==0),]$data_id # 241
-bad_Ss_asd = demo_asd_wg[which(demo_asd_wg$production==0),]$data_id # 5363
-
-# combine data
-d_mat_wg <- rbind(td_mat_wg, asd_mat_wg) %>% filter(!is.element(data_id, c(bad_Ss_asd, bad_Ss_td)))
-d_demo_wg <- demo_td_wg %>% dplyr::select(data_id, age, group, production) %>% 
-  bind_rows(demo_asd_wg) %>%
-  filter(!is.element(data_id, c(bad_Ss_asd, bad_Ss_td)))
-
-sids = d_mat_wg$data_id
-d_mat_wg$data_id = NULL
-d_mat_wg = data.matrix(d_mat_wg)
-row.names(d_mat_wg) = sids
-
-d_group = as.character(d_demo_wg$group)
-
+wg_items <- d_td_wg %>% distinct(category, definition)
+asd_wg <- asd_keep(d_asd_wg)
+dd_wg <- build_dif_data(d_td_wg, asd_wg)
 ```
 
-`r length(bad_Ss_td)` typically-developing (TD) children were removed from the wordbank data (`r nrow(demo_td)` total) due to their not yet producing any words.
-`r length(bad_Ss_asd)` children with ASD were removed from the NDAR data (`r nrow(demo_asd)` total) due to their not yet producing any words.
+The ASD sample has `r n_distinct(asd_wg$GUID)` children from `r n_distinct(asd_wg$collection_id)` collections, one administration per child.
+Children producing no words were removed: `r paste(dd_wg$removed$n, dd_wg$removed$group, collapse = ", ")`.
 
-```{r, echo=F, results=F, message=F, fig.cap="Production sumscores on the CDI:WG for TD vs. ASD children."}
-# Let's show ASD and TD separately
-
-demo_td_wg <- demo_td_wg %>% mutate(prop_produced = production / 396) %>%
-   mutate(prop_produced = case_when(prop_produced == 0 ~ 0.001,
-                                    prop_produced == 1 ~ 0.999,
-                                    TRUE ~ prop_produced)) %>% # can't have 1 or 0
-   dplyr::select(-sex, -ethnicity, -mom_ed)
-
-demo_asd_wg <- demo_asd_wg %>% mutate(prop_produced = production / 396) %>%
-   mutate(prop_produced = case_when(prop_produced == 0 ~ 0.001,
-                                    prop_produced == 1 ~ 0.999,
-                                    TRUE ~ prop_produced)) # can't have 1 or 0
-
-gam_mod_td <- gamlss(prop_produced ~ pbm(age, lambda = 10000),
-                 sigma.formula = ~ pbm(age, lambda = 10000),
-                 family = BE, data = demo_td_wg)
-
-gam_mod_asd <- gamlss(prop_produced ~ pbm(age, lambda = 10000),
-                 sigma.formula = ~ pbm(age, lambda = 10000),
-                 family = BE, data = demo_asd_wg)
-
-cents_asd_wg <- centiles.pred(gam_mod_asd, cent = c(90, 75, 50, 25, 10),
-                       xname = "age", xvalues = 8:48) %>%
-  tibble() %>% pivot_longer(2:6, names_to = "percentile", values_to = "pred") %>%
-  rename(age=x)
-
-
-cents_td_wg <- centiles.pred(gam_mod_td, cent = c(90, 75, 50, 25, 10),
-                       xname = "age", xvalues = 8:24) %>%
-  tibble() %>% pivot_longer(2:6, names_to = "percentile", values_to = "pred") %>%
-  rename(age=x)
-
-p1 <- ggplot(data=demo_td_wg, aes(x=jitter(age))) +
-  geom_point(data=demo_td_wg, alpha=.1, aes(y=production)) + 
-  geom_line(data=cents_td_wg, aes(x=age, y=pred * 396, linetype = percentile)) + 
-  theme_classic() + xlab("Age (months)") + ylab("Production Sumscore") +
-  ggtitle("Typically-Developing")
-
-p2 <- ggplot(data=demo_asd_wg %>% filter(age<60), aes(x=jitter(age))) +
-  geom_point(data=demo_asd_wg %>% filter(age<60), alpha=.1, aes(y=production)) + 
-  geom_line(data=cents_asd_wg, aes(x=age, y=pred * 396, linetype = percentile)) + 
-  theme_classic() + xlab("Age (months)") + ylab("Production Sumscore") + 
-  ggtitle("ASD")
-
-ggpubr::ggarrange(p1, p2, ncol=2, common.legend = T)
+```{r wg-centiles, fig.width=9, fig.height=4, fig.cap="Production sumscores on the CDI:WG for TD vs. ASD children."}
+demo_td_wg <- d_td_wg %>% distinct(data_id, age, production)
+demo_asd_wg <- asd_wg %>% group_by(id, age) %>% summarise(production = sum(value, na.rm = T), .groups = "drop")
+centile_plot(demo_td_wg, demo_asd_wg, 396, 8:18, 8:36)
 ```
 
-```{r fit-wg-model, eval=F}
-mod_dev_group <- fit_mod_intuitive(d_mat_wg, d_group)
-save(mod_dev_group, file="data/prodWG_IRT_model.Rds")
+```{r fit-wg-model}
+mod_wg <- fit_or_load(dd_wg, model_path("WG"))
+
+mm_asd_wg <- extract_group_df(mod_wg, groups = c("TD", "ASD"))
+thresh_wg <- median(mm_asd_wg$d_diff_abs) + 2 * sd(mm_asd_wg$d_diff_abs)
+big_dif_wg <- mm_asd_wg[which(mm_asd_wg$d_diff_abs > thresh_wg), ]
+
+print(item_difficulty_difference_histogram(mm_asd_wg, withNormal = T))
 ```
 
-```{r load-wg-model}
-load("data/prodWG_IRT_model.Rds") # 8-36mo ASD
-#plot_glimmer(mod_dev_group, colnames(d_mat_wg), colnames(d_mat_wg), 
-#             plotName="GLIMMER_asd_prodWG_age8-36mos")
-
-
-mm_asd_wg <- extract_group_df(mod_dev_group, groups=c("TD","ASD"))
-#dif_hist <- item_difficulty_difference_histogram(mm_asd)
-
-thresh_wg = median(mm_asd_wg$d_diff_abs) + 2*sd(mm_asd_wg$d_diff_abs)
-big_dif_wg = mm_asd_wg[which(mm_asd_wg$d_diff_abs > thresh_wg),]
-
-dif_histn_wg <- item_difficulty_difference_histogram(mm_asd_wg, withNormal = T)
-print(dif_histn_wg)
-```
-
-The majority of the items are much easier for TD than for ASD children. 
-We examine the extrema: items with an absolute difficulty difference of at least 2 standard deviations (|d_diff| = `r round(thresh_wg,2)`; red dotted lines in histogram).
-These `r nrow(big_dif_wg)` extrema are listed below.
+We examine the extrema: items with an absolute difficulty difference at least 2 SD above the median (|d_diff| > `r round(thresh_wg,2)`; red dotted lines in the histogram).
+There are `r nrow(big_dif_wg)` such items:
 
 ```{r}
-big_dif_wg <- big_dif_wg %>% left_join(wg_items)
+big_dif_wg <- big_dif_wg %>% left_join(wg_items, by = "definition")
 
-big_dif_wg %>% arrange(d_diff) %>% 
+big_dif_wg %>% arrange(d_diff) %>%
   relocate(category, definition) %>%
-  rename(d_TD=d_g1, d_ASD=d_g2) %>%
+  rename(d_TD = d_g1, d_ASD = d_g2) %>%
   dplyr::select(-a1, -group1, -group2) %>%
-  kable(format = "html", table.attr = "style='width:50%;'", digits=2)
+  kable(format = "html", table.attr = "style='width:50%;'", digits = 2)
+
+sort(table(big_dif_wg$category)) %>% kable(col.names = c("Category", "Frequency"))
 ```

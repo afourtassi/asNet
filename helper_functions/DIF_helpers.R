@@ -3,7 +3,24 @@ require(janitor)
 
 # MIRT FUNCTION HELPERS ---------------------------------------------------
 fit_mod_intuitive <- function(data, groups){
-  multipleGroup(data, 1, itemtype = "Rasch", groups, invariance = "free_var", SE = TRUE, verbose = T)
+  # Rasch model with item difficulties free per group, latent means fixed at 0
+  # and latent variances free. With no cross-group equality constraints this
+  # multiple-group model factorizes exactly into separate single-group fits, so
+  # we fit each group with mirt(). (multipleGroup(..., invariance = "free_var")
+  # is now rejected as unidentified, and multipleGroup() in mirt 1.46 silently
+  # returns NULL with ~675+ items, e.g. the 680-item CDI:WS.)
+  grp_levels <- unique(groups)
+  mods <- lapply(grp_levels, function(g)
+    mirt(data[groups == g, , drop = FALSE], 1, itemtype = "Rasch", SE = TRUE, verbose = FALSE))
+  names(mods) <- grp_levels
+  class(mods) <- c("dif_by_group", "list")
+  mods
+}
+
+# coef() for either a mirt MultipleGroupClass or a dif_by_group list
+group_coefs <- function(group_model) {
+  if (inherits(group_model, "dif_by_group")) lapply(group_model, coef, simplify = TRUE)
+  else coef(group_model, simplify = TRUE)
 }
 
 
@@ -52,21 +69,21 @@ plot_glimmer <- function(mod_intuitive, item_names, items_to_plot, plotName='', 
 
 
 extract_group_df <- function(group_model, groups=c("Male","Female")) {
-  Mit = as_tibble(coef(group_model, simplify=T)[[groups[1]]]$items) %>%
-    mutate(definition = rownames(coef(group_model, simplify=T)[[groups[1]]]$items),
+  cf <- group_coefs(group_model)
+  Mit = as_tibble(cf[[groups[1]]]$items) %>%
+    mutate(definition = rownames(cf[[groups[1]]]$items),
            group1 = groups[1],
            group2 = groups[2]) %>%
-    dplyr::select(-g, -u) %>%
+    dplyr::select(-any_of(c("g", "u"))) %>%
     #mutate(d = -d) %>% # from easiness to difficulty
     rename(d_g1 = d) 
-  Fit = as_tibble(coef(group_model, simplify=T)[[groups[2]]]$items) %>%
-    mutate(definition = rownames(coef(group_model, simplify=T)[[groups[2]]]$items)) %>%
-    dplyr::select(-g, -u) %>%
+  Fit = as_tibble(cf[[groups[2]]]$items) %>%
+    mutate(definition = rownames(cf[[groups[2]]]$items)) %>%
+    dplyr::select(-any_of(c("g", "u", "a1"))) %>%
     #mutate(d = -d) %>% # from easiness to difficulty
     rename(d_g2 = d) 
     
-  
-  combo <- Mit %>% left_join(Fit) %>%
+  combo <- Mit %>% left_join(Fit, by = "definition") %>%
     mutate(d_diff = d_g2 - d_g1,
            d_diff_abs = abs(d_diff)) 
   return(combo)

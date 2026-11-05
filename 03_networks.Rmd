@@ -60,54 +60,15 @@ source(paste(getwd(),"/helper_functions/all_helper.r",sep = ""), chdir = T)
 #http://macappstore.org/espeak/
 
 #Load probabilsitic models
-source(paste(getwd(),"/models/all_models.r",sep = ""), chdir = T)
+source(paste(getwd(),"/helper_functions/all_models.R",sep = ""), chdir = T)
 
 ```
 
 
-Load data_AS_WS
+Load cleaned ASD WS data (see 01_prep_data.Rmd for QC and response coding)
 ```{r}
-data_AS_WS <- read.delim("mci_sentences02.txt", header = TRUE, sep = "\t", dec = ".")
-
-# extracting first row as a descriptive dataframe
-description_WS <- data_AS_WS[1:1,]
-description_WS <- as.data.frame(t(description_WS))
-names(description_WS) <- "description"
-
-
-
-# what we get rid of:
-eliminated_WS <- data_AS_WS%>%
-  select(c(701:709,780:850))%>%
-  slice(1:1)%>%
-  gather(key = "Column names", value = "Description")#%>%
-  #head(10)
-
-#feather::write_feather(eliminated_WS,"saved_data/eliminated_WS.feather")
-
-#using mci_sentences02_id	as a disctincetive id and The NDAR Global Unique Identifier 
-data_raw_AS_WS <- data_AS_WS %>%
-  select(c("mci_sentences02_id","subjectkey","interview_age", 21:779)) %>% # starting from 785 is complexity. we kept vocabs, word endings, word forms.
-  select(-(684:692))
-
-colnames(data_raw_AS_WS) <- as.character(unlist(data_raw_AS_WS[1,])) #unlist the row
-data_raw_AS_WS = data_raw_AS_WS[-1, ]
-
-data_raw_AS_WS<- data_raw_AS_WS %>%
-  rename(id = "mci_sentences02_id",
-         GUID = "The NDAR Global Unique Identifier (GUID) for research subject", 
-         age = "Age in months at the time of the interview/test/sampling/imaging.")%>%
-  mutate(age = as.numeric(as.character(age)))
-
-data_clean_AS_WS <- data_raw_AS_WS %>%
-  gather(key = "definition", value = "value", -c(id,GUID,age))%>%
-  separate(definition, c("category","definition"),sep = "\\. ") %>%
-  mutate_all(na_if,"",)%>% #if blank then fill in NA
-   mutate(value = ifelse(value == 0, FALSE, TRUE))
-
-#for chapter 12 analysis
-#feather::write_feather(data_clean_AS_WS,"saved_data/data_clean_AS_WS.feather")
-
+load("data/nda_private/cached_data.Rds")
+data_clean_AS_WS <- d_asd_ws %>% select(id, GUID, age, category, definition, value)
 
 data_all_AS_WS <- data_clean_AS_WS %>%
      group_by(category, definition, age) %>%
@@ -160,7 +121,7 @@ data_aoa_AS_WS <- map(list_by_item, fit_inst_measure_uni) %>%
   distinct()  # negative values in aoa, same in main_analysis.rmd
 
 #feather::write_feather(data_aoa_AS_WS,"saved_data/data_aoa_AS_WS.feather")
-data_aoa_AS_WS <- feather::read_feather("saved_data/data_aoa_AS_WS.feather") 
+#data_aoa_AS_WS <- feather::read_feather("saved_data/data_aoa_AS_WS.feather") # stale: pre-QC data
 ```
 
 Load aoa dataframe from TD
@@ -796,7 +757,7 @@ Train the probabilistic models
 
 ```{r}
 #Load probabilsitic models
-source(paste(getwd(),"/models/all_models.r",sep = ""), chdir = T)
+source(paste(getwd(),"/helper_functions/all_models.R",sep = ""), chdir = T)
 #Isolateed predictors
 model_semPAT <-  paste(helper, sem_PAT, optimize, sep = '\n')
 model_semPAC <-  paste(helper, sem_PAC, optimize, sep = '\n')
