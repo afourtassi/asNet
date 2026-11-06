@@ -30,10 +30,11 @@ These results are from the cleaned data on the `data-cleaning-trust-scores` bran
 | `03_networks.Rmd` | Age of acquisition, the semantic and phonological noun networks, static regressions on age of acquisition, and network growth models fit by maximum likelihood. |
 | `04_DIF_analysis.Rmd` | Fits a Rasch model to each group and flags items with large DIF. |
 | `05_IRT_summary.Rmd` | Summary report of the DIF and network results, built from saved outputs. |
+| `06_anchored_DIF.Rmd` | DIF against the fixed Wordbank English 2PL item bank: ASD ability on the Wordbank scale, language age, and iteratively purified anchored DIF. |
 | `00_investigate_missing_data.Rmd` | Exploratory notes on missing item-level data. |
 | `DATA_FIXES.md` | What the cleaning does and why, and how the fixes changed the results. |
 | `helper_functions/` | `ndar_qc.R` (QC and trust scores), `network_growth.R`, `DIF_helpers.R` and `irt_report_data.R`, plus older helpers from the original analyses. |
-| `in_files/` | Free-association norms used for the semantic network. |
+| `in_files/` | Free-association norms used for the semantic network; the Wordbank 2PL item bank and ability norms (exported from `adaptive-cdi` by `helper_functions/export_wordbank_params.R`). |
 | `saved_data/` | Cached Wordbank-derived inputs (feather), including IPA forms for the phonological network. |
 | `data/` | Wordbank TD data (`eng_ws_raw_data.Rds`, `eng_wg_raw_data.Rds`) and the list of NDA collections (`NDA data sources.csv`). |
 | `journal/` | Manuscript draft. |
@@ -46,6 +47,8 @@ These results are from the cleaned data on the `data-cleaning-trust-scores` bran
 - collection trust scores
 - an item-profile check
 - repair of a known column shift in one collection
+
+`06_anchored_DIF.Rmd` runs both forms with and without the unconfirmed-diagnosis collections (about a minute in total).
 
 `04_DIF_analysis.Rmd` saves its model fits and item tables to `data/nda_private/`.
 
@@ -83,6 +86,7 @@ rmarkdown::render("04_DIF_analysis.Rmd")
 rmarkdown::render("04_DIF_analysis.Rmd", params = list(exclude_dx_unconfirmed = TRUE),
                   output_file = "04_DIF_analysis_dxconfirmed.html")
 rmarkdown::render("05_IRT_summary.Rmd")
+rmarkdown::render("06_anchored_DIF.Rmd")
 ```
 
 `03_networks.Rmd` and `04_DIF_analysis.Rmd` take parameters for sensitivity analyses:

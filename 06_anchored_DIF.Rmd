@@ -1,0 +1,241 @@
+---
+title: "DIF against the Wordbank item bank"
+author: "ASD CDI team"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  include_flagged: false  # include collections that fail the item-profile check
+---
+
+```{r setup, message=F, warning=F, echo=F}
+library(tidyverse)
+library(knitr)
+knitr::opts_chunk$set(message = F, warning = F, echo = F)
+theme_set(theme_classic(base_size = 12))
+source("helper_functions/anchored_dif.R")
+
+load("data/nda_private/cached_data.Rds")   # from 01_prep_data.Rmd
+items <- read_csv("in_files/wordbank_2pl_items.csv", show_col_types = FALSE)
+norms <- read_csv("in_files/wordbank_2pl_ability_norms.csv", show_col_types = FALSE)
+load_one <- function(f) { e <- new.env(); load(f, envir = e); base::get(ls(e)[1], envir = e) }
+```
+
+## Approach
+
+`04_DIF_analysis.Rmd` fits a separate Rasch model to each group and links the two
+scales by assuming the average item has no DIF (mean–mean linking). Here the TD side
+is instead a **fixed, external item bank**: the Wordbank English 2PL from
+`adaptive-cdi`, calibrated on 7,633 children aged 12–36 months (WS and WG production
+on a common 680-item scale; `in_files/wordbank_2pl_items.csv`).
+
+With item parameters fixed:
+
+1. The ASD sample's ability distribution is estimated on the Wordbank scale (EM over a
+   quadrature grid, anchor items only).
+2. For each item, a shift *δ* is estimated so that
+   P(produce | θ) = logistic(*a*θ + *d* + *δ*), averaging over each child's posterior
+   over θ. An item's own response is left out of the posterior it is judged against.
+   **δ < 0 = harder for ASD children than for Wordbank children of the same ability.**
+   A slope change (non-uniform DIF) is also tested.
+3. Items with BH-adjusted *p* < .05 and |*δ*| > 0.5 logits are dropped from the
+   anchor set and the sample is re-scored, until the anchor set stops changing.
+4. Items with BH-adjusted *p* < .05 and |*δ*| > 1 logit (an odds ratio of 2.7 at the
+   same ability) are **flagged** as large DIF; 0.5–1 logit is reported as moderate.
+   With fixed item parameters, standard errors are small (≈0.2 logits), so most
+   items with even modest shifts are significant: the effect-size cut-off does the work.
+
+Unlike mean–mean linking, this does not force the average DIF to zero: the scale is
+set by the Wordbank calibration and the DIF-free anchors. A simulation from the item
+bank (385 children, 30 items with planted DIF of ±1–1.5 logits, `helper_functions/anchored_dif.R`)
+recovered 29/30 DIF items with 2 false positives and r = .98 between true and
+estimated *δ*.
+
+```{r run}
+asd_keep <- function(d, drop_unconfirmed = FALSE) {
+  d <- d %>% filter(one_per_child)
+  if (!params$include_flagged) d <- d %>% filter(item_profile_ok)
+  if (drop_unconfirmed) d <- d %>% filter(!asd_dx_unconfirmed)
+  d
+}
+
+runs <- expand_grid(form = c("WS", "WG"), drop_unconfirmed = c(FALSE, TRUE)) %>%
+  mutate(version = ifelse(drop_unconfirmed, "dx_confirmed", "main"))
+
+results <- pmap(runs, function(form, drop_unconfirmed, version) {
+  d <- if (form == "WS") d_asd_ws else d_asd_wg
+  X <- response_matrix(asd_keep(d, drop_unconfirmed), items)
+  anchored_dif(X, items)
+})
+names(results) <- paste(runs$form, runs$version, sep = "_")
+
+suffix <- if (params$include_flagged) "_withflagged" else ""
+anchored <- list(runs = runs, results = results)
+save(anchored, file = sprintf("data/nda_private/anchored_dif%s.Rds", suffix))
+
+res_items <- map2_dfr(results, names(results), ~ .x$items %>%
+  mutate(run = .y) %>% separate(run, c("form", "version"), sep = "_", extra = "merge")) %>%
+  left_join(items %>% select(definition, a, d_wb = d, b), by = "definition") %>%
+  left_join(d_td_ws %>% distinct(definition, category), by = "definition") %>%
+  mutate(category = str_replace_all(category, "_", " "))
+
+summ <- map2_dfr(results, names(results), ~ tibble(
+  run = .y, children = nrow(.x$theta), mu = .x$mu, sigma = .x$sigma,
+  iterations = .x$iterations, anchors = sum(.x$items$anchor),
+  moderate = sum(.x$items$size == "moderate"),
+  flagged = sum(.x$items$flagged),
+  harder = sum(.x$items$flagged & .x$items$delta < 0),
+  easier = sum(.x$items$flagged & .x$items$delta > 0),
+  nonuniform = sum(p.adjust(.x$items$p_nonuniform, "BH") < .05 & .x$items$informative)))
+```
+
+```{r summary-table}
+summ %>% mutate(across(c(mu, sigma), ~ round(.x, 2))) %>%
+  kable(col.names = c("Run", "Children", "Ability mean", "Ability SD", "Iterations",
+                      "Anchors", "Moderate DIF", "Large DIF (flagged)", "Harder for ASD", "Easier for ASD",
+                      "Non-uniform (BH < .05)"),
+        caption = "Ability is on the Wordbank scale (calibration sample: mean 0, SD 1). 'dx_confirmed' drops collections without a confirmed ASD diagnosis.")
+```
+
+## Check: Wordbank item bank vs our TD Rasch fit
+
+The TD group in `04` is a Wordbank subsample, so this mainly checks that the item
+orderings agree across the two calibrations (Rasch on WS 16–30 months vs 2PL on WS+WG
+12–36 months).
+
+```{r bank-check, fig.width=5, fig.height=5}
+rasch <- map_dfr(c("WS", "WG"), ~ load_one(sprintf("data/nda_private/dif_items_%s.Rds", .x)) %>%
+                   transmute(definition, d_TD = d_g1, d_diff_c, extreme) %>% mutate(form = .x)) %>%
+  mutate(definition = ifelse(form == "WG" & definition %in% c("in", "inside"), "inside/in", definition)) %>%
+  distinct(form, definition, .keep_all = TRUE)
+chk <- rasch %>% filter(form == "WS") %>% inner_join(items, by = "definition")
+ggplot(chk, aes(-b, d_TD)) + geom_point(alpha = .4) +
+  labs(x = "Wordbank 2PL easiness (−b)", y = "TD Rasch easiness (d), 04",
+       subtitle = sprintf("WS items: r = %.3f", cor(-chk$b, chk$d_TD)))
+```
+
+## Ability on the Wordbank scale
+
+```{r ability, fig.width=9, fig.height=4.5}
+theta <- map2_dfr(results[c("WS_main", "WG_main")], c("WS", "WG"), ~ .x$theta %>% mutate(form = .y)) %>%
+  left_join(admins %>% select(form, row, age, collection_id, asd_dx_unconfirmed), by = c("form", "row"))
+nb <- norms %>% filter(n >= 50)
+ggplot(theta, aes(age, theta)) +
+  geom_ribbon(data = nb, aes(x = age, ymin = q10, ymax = q90), inherit.aes = FALSE, fill = "grey85") +
+  geom_ribbon(data = nb, aes(x = age, ymin = q25, ymax = q75), inherit.aes = FALSE, fill = "grey70") +
+  geom_line(data = nb, aes(x = age, y = q50), inherit.aes = FALSE) +
+  geom_jitter(aes(colour = asd_dx_unconfirmed), width = .3, alpha = .5, size = 1) +
+  facet_wrap(~form) +
+  scale_colour_manual(values = c(`FALSE` = "#2471a3", `TRUE` = "#e67e22"),
+                      labels = c("dx confirmed collections", "dx unconfirmed (2024)"), name = NULL) +
+  labs(x = "Age (months)", y = "Ability (Wordbank 2PL scale)",
+       caption = "Grey bands: Wordbank 10–90th and 25–75th percentiles; line: median") +
+  theme(legend.position = "bottom")
+```
+
+```{r language-age}
+theta <- theta %>% mutate(lang_age = language_age(theta, norms), delay = age - lang_age)
+theta %>% group_by(form, dx_unconfirmed = asd_dx_unconfirmed) %>%
+  summarise(children = n(), median_age = median(age),
+            below_10th = mean(theta < approx(nb$age, nb$q10, xout = age, rule = 2)$y),
+            median_delay = median(delay, na.rm = TRUE),
+            delay_n = sum(!is.na(delay)), .groups = "drop") %>%
+  mutate(below_10th = scales::percent(below_10th, 1), median_delay = round(median_delay, 1)) %>%
+  kable(col.names = c("Form", "Dx unconfirmed", "Children", "Median age", "Below Wordbank 10th %ile",
+                      "Median delay (mo)", "Children with a language age"),
+        caption = "Below 10th %ile: ability below the Wordbank 10th percentile for the child's age (ages outside 12–30 months compared with the nearest norm month). Language age: age at which the Wordbank median reaches the child's ability, defined only within the 12–30-month norm range.")
+```
+
+## DIF results
+
+```{r dif-plot-fn}
+dif_plot <- function(f) {
+  d <- res_items %>% filter(form == f, version == "main", informative)
+  ggplot(d, aes(b, delta)) +
+    geom_hline(yintercept = 0) +
+    geom_hline(yintercept = c(-1, 1), linetype = "dashed", alpha = .4) +
+    geom_point(aes(colour = case_when(!flagged ~ "not flagged",
+                                      delta < 0 ~ "harder for ASD",
+                                      TRUE ~ "easier for ASD")), alpha = .7) +
+    ggrepel::geom_text_repel(data = filter(d, flagged), aes(label = definition),
+                             size = 2.8, max.overlaps = 40) +
+    scale_colour_manual(values = c("harder for ASD" = "#c0392b", "easier for ASD" = "#2471a3",
+                                   "not flagged" = "grey75"), name = NULL) +
+    labs(x = "Wordbank difficulty (b)", y = "DIF δ (logits)") +
+    theme(legend.position = "bottom")
+}
+flag_table <- function(f) {
+  res_items %>% filter(form == f) %>%
+    select(definition, category, version, delta, se, dprob, flagged) %>%
+    pivot_wider(names_from = version, values_from = c(delta, se, dprob, flagged)) %>%
+    filter(flagged_main | flagged_dx_confirmed) %>%
+    arrange(delta_main) %>%
+    transmute(Item = definition, Section = category,
+              `δ (SE)` = sprintf("%.2f (%.2f)", delta_main, se_main),
+              `Δ P(produce)` = scales::percent(dprob_main, 1),
+              `δ without 2024` = round(delta_dx_confirmed, 2),
+              Flagged = case_when(flagged_main & flagged_dx_confirmed ~ "both",
+                                  flagged_main ~ "main only", TRUE ~ "without 2024 only"))
+}
+```
+
+### Words & Sentences
+
+```{r ws-plot, fig.width=9, fig.height=7}
+dif_plot("WS")
+```
+
+```{r ws-table}
+kable(flag_table("WS"), caption = "WS items flagged in either run. Δ P(produce): average change in the probability of producing the word across the ASD sample's ability distribution.")
+```
+
+### Words & Gestures
+
+```{r wg-plot, fig.width=9, fig.height=7}
+dif_plot("WG")
+```
+
+```{r wg-table}
+kable(flag_table("WG"), caption = "WG items flagged in either run.")
+```
+
+### By CDI section
+
+```{r sections, fig.width=9, fig.height=6}
+res_items %>% filter(version == "main", informative, !is.na(category)) %>%
+  group_by(form, category) %>%
+  summarise(mean_delta = mean(delta), se = sd(delta) / sqrt(n()), flagged = sum(flagged), .groups = "drop") %>%
+  ggplot(aes(reorder(category, mean_delta), mean_delta, fill = mean_delta < 0)) +
+  geom_col() + geom_errorbar(aes(ymin = mean_delta - se, ymax = mean_delta + se), width = .2) +
+  facet_wrap(~form) + coord_flip() +
+  scale_fill_manual(values = c(`TRUE` = "#c0392b", `FALSE` = "#2471a3"), guide = "none") +
+  labs(x = NULL, y = "Mean δ (± SE)")
+```
+
+## Comparison with the Rasch DIF in 04
+
+```{r compare, fig.width=9, fig.height=4.5}
+cmp <- res_items %>% filter(version == "main", informative) %>%
+  inner_join(rasch, by = c("form", "definition"))
+cmp_stats <- cmp %>% group_by(form) %>%
+  summarise(r = cor(delta, d_diff_c), both = sum(flagged & extreme),
+            anchored_only = sum(flagged & !extreme), rasch_only = sum(!flagged & extreme))
+ggplot(cmp, aes(d_diff_c, delta)) +
+  geom_abline(linetype = "dashed") + geom_point(alpha = .4) +
+  facet_wrap(~form) +
+  labs(x = "Rasch centered DIF (04)", y = "Anchored DIF δ (this notebook)")
+kable(cmp_stats, digits = 2, col.names = c("Form", "r", "Flagged in both", "Anchored only", "Rasch only"))
+```
+
+## Notes
+
+- The Wordbank calibration covers 12–36 months, while the ASD WS sample spans 12–48
+  months. Ability is still defined for older children, but item parameters were not
+  estimated on children that old, and the language-age conversion stops at 30 months.
+- Standard errors treat item parameters as known and ignore clustering by collection.
+  A bootstrap over children (or collections) would widen them.
+- The ASD group is defined by collection, not by a child-level diagnosis. Collections
+  include siblings and possibly non-autistic controls; child-level labels from NDA
+  (`ndar_subject01` phenotype, ADOS/ADI-R) are the next step.
