@@ -162,6 +162,48 @@ d_asd_ws <- add_meta(d_asd_ws, "WS")
 d_asd_wg <- add_meta(d_asd_wg, "WG")
 ```
 
+## Item-profile check
+
+The checks above can't catch a lab that mapped responses to the wrong items: totals still agree, and section totals look normal.
+This check compares each collection's item-by-item production rates with what TD children of the same vocabulary size produce (Wordbank).
+
+- Real ASD differences are modest and shared across collections.
+- A mapping error shows up as many items far off (|observed − expected| > .30) in a pattern that replicates across random halves of the collection's children.
+- A collection is flagged when more than 2% of items are that far off **and** the split-half correlation of its residual profile is above .70.
+- Flagged collections get `item_profile_ok = FALSE` and tier C: their stored sumscores may be fine, but their item-level data are not.
+
+```{r item-profile}
+base::load("data/eng_wg_raw_data.Rds")
+td_ref <- list(
+  WS = d_td_ws %>% transmute(row = data_id, definition, value = as.integer(produces)),
+  WG = eng_wg %>% filter(!is.na(category)) %>%
+    transmute(row = data_id, definition, value = as.integer(value == "produces")))
+profile <- bind_rows(
+  item_profile_check(d_asd_ws %>% filter(one_per_child), td_ref$WS) %>% mutate(form = "WS"),
+  item_profile_check(d_asd_wg %>% filter(one_per_child), td_ref$WG) %>% mutate(form = "WG"))
+
+profile %>% select(form, collection_id, profile_admins, gross_items, split_half_r,
+                   item_profile_anomaly, worst_items) %>%
+  arrange(form, desc(gross_items)) %>% kable(digits = 2)
+
+trust <- trust %>%
+  left_join(profile %>% select(form, collection_id, gross_items, split_half_r, item_profile_anomaly),
+            by = c("form", "collection_id")) %>%
+  mutate(item_profile_ok = !coalesce(item_profile_anomaly, FALSE),
+         tier = ifelse(!item_profile_ok, "C", tier)) %>%
+  select(-item_profile_anomaly)
+
+upd <- function(d, f) d %>% select(-tier) %>%
+  left_join(trust %>% filter(form == f) %>% select(collection_id, tier, item_profile_ok), by = "collection_id")
+admins <- admins %>% select(-tier) %>%
+  left_join(trust %>% select(form, collection_id, tier, item_profile_ok), by = c("form", "collection_id"))
+d_asd_ws <- upd(d_asd_ws, "WS")
+d_asd_wg <- upd(d_asd_wg, "WG")
+```
+
+Flagged: `r with(filter(trust, !item_profile_ok), paste(form, collection_id, collapse = ", "))`.
+Downstream analyses exclude flagged collections by default (`include_flagged` parameter).
+
 # Final dataset stats
 
 ```{r final-stats}
@@ -186,6 +228,6 @@ bind_rows(d_asd_ws %>% mutate(form = "WS"), d_asd_wg %>% mutate(form = "WG")) %>
 # Save data
 
 ```{r save}
-save(d_asd_wg, d_asd_ws, d_td_ws, admins, trust, wg_coding, QC,
+save(d_asd_wg, d_asd_ws, d_td_ws, admins, trust, wg_coding, profile, QC,
      file = "data/nda_private/cached_data.Rds")
 ```

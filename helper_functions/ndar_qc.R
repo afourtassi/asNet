@@ -398,6 +398,52 @@ collection_trust <- function(a, coding = NULL) {
     arrange(form, tier, desc(trust))
 }
 
+# ---- item-profile check --------------------------------------------------------
+# Checks that each collection's item responses look like CDI responses at all.
+# For each item, a TD reference model gives P(produces | log vocabulary size).
+# Within a collection, compare each item's observed production rate with what the
+# TD model predicts for those same children.
+# - Real ASD/TD differences (DIF) are shared across collections and modest.
+# - A lab that mapped responses to the wrong items shows many items far off
+#   (|obs - exp| > gross_resid) in a pattern that is stable across random halves
+#   of its children (split-half r of the residual profile).
+# asd: long data (row, collection_id, definition, value); td: (row, definition, value)
+item_profile_check <- function(asd, td, gross_resid = .30, max_gross_share = .02,
+                               min_split_r = .70, min_admins = 10, seed = 1) {
+  vocab_window <- function(d) {
+    n_items <- n_distinct(d$definition)
+    d %>% group_by(row) %>% mutate(prod = sum(value, na.rm = TRUE)) %>% ungroup() %>%
+      filter(prod >= 20, prod <= 0.9 * n_items)
+  }
+  td <- vocab_window(td)
+  ref <- td %>% group_by(definition) %>%
+    summarise(b0 = coef(suppressWarnings(glm(value ~ log(prod), binomial)))[1],
+              b1 = coef(suppressWarnings(glm(value ~ log(prod), binomial)))[2],
+              .groups = "drop")
+  d <- vocab_window(asd) %>% inner_join(ref, by = "definition") %>%
+    mutate(resid = value - plogis(b0 + b1 * log(prod)))
+  split_r <- function(x) {
+    ids <- unique(x$row)
+    set.seed(seed)
+    h <- sample(ids, floor(length(ids) / 2))
+    w <- x %>% group_by(definition, half = row %in% h) %>%
+      summarise(r = mean(resid), .groups = "drop") %>%
+      pivot_wider(names_from = half, values_from = r)
+    cor(w$`TRUE`, w$`FALSE`, use = "complete.obs")
+  }
+  d %>% group_by(collection_id) %>%
+    group_modify(function(x, key) {
+      it <- x %>% group_by(definition) %>% summarise(resid = mean(resid), .groups = "drop")
+      tibble(profile_admins = n_distinct(x$row),
+             gross_items = sum(abs(it$resid) > gross_resid),
+             gross_share = mean(abs(it$resid) > gross_resid),
+             split_half_r = if (n_distinct(x$row) >= min_admins) split_r(x) else NA_real_,
+             worst_items = paste(head(it$definition[order(-abs(it$resid))], 6), collapse = ", "))
+    }) %>% ungroup() %>%
+    mutate(item_profile_anomaly = profile_admins >= min_admins &
+             gross_share > max_gross_share & coalesce(split_half_r, 0) > min_split_r)
+}
+
 # ---- long format -------------------------------------------------------------
 
 to_long <- function(a, m, dict, form, produce_code = NULL) {

@@ -5,6 +5,8 @@ date: '2026-11-05'
 output: html_document
 params:
   tier_A_only: false   # sensitivity check: only collections with trust tier A
+  exclude_dx_unconfirmed: false  # sensitivity check: drop collections without confirmed ASD dx (2024, 9)
+  include_flagged: false  # include collections that fail the item-profile check (WS 2024)
   refit: false         # refit IRT models even if a cached fit exists
 ---
 
@@ -23,9 +25,13 @@ load("data/nda_private/cached_data.Rds") # from 01_prep_data.Rmd
 asd_keep <- function(d) {
   d <- d %>% filter(one_per_child)
   if (params$tier_A_only) d <- d %>% filter(tier == "A")
+  if (params$exclude_dx_unconfirmed) d <- d %>% filter(!asd_dx_unconfirmed)
+  if (!params$include_flagged) d <- d %>% filter(item_profile_ok)
   d
 }
-suffix <- if (params$tier_A_only) "_tierA" else ""
+suffix <- paste0(if (params$tier_A_only) "_tierA" else "",
+                 if (params$exclude_dx_unconfirmed) "_dxconfirmed" else "",
+                 if (params$include_flagged) "_withflagged" else "")
 model_path <- function(form) sprintf("data/nda_private/prod%s_IRT_model%s.Rds", form, suffix)
 
 # Build TD + ASD response matrix (same item order), dropping children who produce 0 words
@@ -75,6 +81,8 @@ centile_plot <- function(demo_td, demo_asd, n_items, td_ages, asd_ages) {
 ```
 
 `r if (params$tier_A_only) "**Sensitivity analysis: tier-A collections only.**"`
+`r if (params$exclude_dx_unconfirmed) "**Sensitivity analysis: collections without confirmed ASD diagnosis excluded.**"`
+`r if (params$include_flagged) "**Sensitivity analysis: includes collections that fail the item-profile check (see 01_prep_data).**" else "Collections that fail the item-profile check in 01_prep_data (WS 2024) are excluded."`
 
 # CDI:WS Production
 
@@ -97,22 +105,26 @@ centile_plot(demo_td_ws, demo_asd_ws, 680, 16:30, 12:48)
 mod_ws <- fit_or_load(dd_ws, model_path("WS"))
 
 mm_asd <- extract_group_df(mod_ws, groups = c("TD", "ASD"))
-thresh <- median(mm_asd$d_diff_abs) + 2 * sd(mm_asd$d_diff_abs)
-big_dif <- mm_asd[which(mm_asd$d_diff_abs > thresh), ]
+mm_asd <- flag_dif(mm_asd)
+thresh <- 2 * sd(mm_asd$d_diff)
+big_dif <- mm_asd %>% filter(extreme)
 
 print(item_difficulty_difference_histogram(mm_asd, withNormal = T))
+save(mm_asd, file = sprintf("data/nda_private/dif_items_WS%s.Rds", suffix))
 ```
 
-We examine the extrema: items with an absolute difficulty difference at least 2 SD above the median (|d_diff| > `r round(thresh,2)`; red dotted lines in the histogram).
+`d` is an easiness intercept, so d_ASD − d_TD < 0 means an item is harder for children with ASD than for TD children of the same overall vocabulary level.
+Each group's latent mean is fixed at 0, so the overall gap between the samples appears as a uniform shift in d_ASD − d_TD (here `r round(mean(mm_asd$d_diff), 2)`).
+We remove that shift and flag items more than 2 SD from it (|centered difference| > `r round(thresh,2)`; red dotted lines in the histogram).
 There are `r nrow(big_dif)` such items:
 
 ```{r}
 big_dif <- big_dif %>% left_join(wb_items, by = "definition")
 
-big_dif %>% arrange(d_diff) %>%
+big_dif %>% arrange(d_diff_c) %>%
   relocate(category, definition) %>%
-  rename(d_TD = d_g1, d_ASD = d_g2) %>%
-  dplyr::select(-a1, -group1, -group2) %>%
+  rename(d_TD = d_g1, d_ASD = d_g2, centered_diff = d_diff_c) %>%
+  dplyr::select(category, definition, d_TD, d_ASD, d_diff, centered_diff) %>%
   kable(format = "html", table.attr = "style='width:50%;'", digits = 2)
 
 sort(table(big_dif$category)) %>% kable(col.names = c("Category", "Frequency"))
@@ -147,22 +159,26 @@ centile_plot(demo_td_wg, demo_asd_wg, 396, 8:18, 8:36)
 mod_wg <- fit_or_load(dd_wg, model_path("WG"))
 
 mm_asd_wg <- extract_group_df(mod_wg, groups = c("TD", "ASD"))
-thresh_wg <- median(mm_asd_wg$d_diff_abs) + 2 * sd(mm_asd_wg$d_diff_abs)
-big_dif_wg <- mm_asd_wg[which(mm_asd_wg$d_diff_abs > thresh_wg), ]
+mm_asd_wg <- flag_dif(mm_asd_wg)
+thresh_wg <- 2 * sd(mm_asd_wg$d_diff)
+big_dif_wg <- mm_asd_wg %>% filter(extreme)
 
 print(item_difficulty_difference_histogram(mm_asd_wg, withNormal = T))
+save(mm_asd_wg, file = sprintf("data/nda_private/dif_items_WG%s.Rds", suffix))
 ```
 
-We examine the extrema: items with an absolute difficulty difference at least 2 SD above the median (|d_diff| > `r round(thresh_wg,2)`; red dotted lines in the histogram).
+`d` is an easiness intercept, so d_ASD − d_TD < 0 means an item is harder for children with ASD than for TD children of the same overall vocabulary level.
+Each group's latent mean is fixed at 0, so the overall gap between the samples appears as a uniform shift in d_ASD − d_TD (here `r round(mean(mm_asd_wg$d_diff), 2)`).
+We remove that shift and flag items more than 2 SD from it (|centered difference| > `r round(thresh_wg,2)`; red dotted lines in the histogram).
 There are `r nrow(big_dif_wg)` such items:
 
 ```{r}
 big_dif_wg <- big_dif_wg %>% left_join(wg_items, by = "definition")
 
-big_dif_wg %>% arrange(d_diff) %>%
+big_dif_wg %>% arrange(d_diff_c) %>%
   relocate(category, definition) %>%
-  rename(d_TD = d_g1, d_ASD = d_g2) %>%
-  dplyr::select(-a1, -group1, -group2) %>%
+  rename(d_TD = d_g1, d_ASD = d_g2, centered_diff = d_diff_c) %>%
+  dplyr::select(category, definition, d_TD, d_ASD, d_diff, centered_diff) %>%
   kable(format = "html", table.attr = "style='width:50%;'", digits = 2)
 
 sort(table(big_dif_wg$category)) %>% kable(col.names = c("Category", "Frequency"))

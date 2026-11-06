@@ -89,6 +89,16 @@ extract_group_df <- function(group_model, groups=c("Male","Female")) {
   return(combo)
 }
 
+# Flag DIF items. Each group's latent mean is fixed at 0, so any overall ability
+# difference between the samples shows up as a uniform shift in d_diff. Center the
+# differences (mean-mean linking: assumes most items are DIF-free) and flag items
+# more than `k` SD from the mean shift. d is an easiness intercept, so
+# d_diff_c < 0 means the item is relatively harder for group 2 (ASD).
+flag_dif <- function(mm, k = 2) {
+  mm %>% mutate(d_diff_c = d_diff - mean(d_diff),
+                extreme = abs(d_diff_c) > k * sd(d_diff))
+}
+
 get_extreme_item_difficulty_differences <- function(mm) {
   #yfit <- dnorm(mm$d_diff, mean = mean(mm$d_diff), sd = sd(mm$d_diff)) 
   mm <- mm %>% mutate(d_diff = d_g2 - d_g1)
@@ -111,7 +121,7 @@ item_difficulty_difference_histogram <- function(mm, withNormal=F) {
     geom_vline(aes(xintercept=median(d_diff)), linetype="dashed") +
     geom_vline(aes(xintercept=max_dif), linetype="dashed", color="red") +
     geom_vline(aes(xintercept=min_dif), linetype="dashed", color="red") +
-    xlab(paste(mm$group2, "-", mm$group1, "Item Difficulty"))
+    xlab(paste(mm$group2[1], "-", mm$group1[1], "item easiness (d)"))
   
   if(withNormal) {
     p <- p + stat_function(fun = dnorm, alpha=.6, 
