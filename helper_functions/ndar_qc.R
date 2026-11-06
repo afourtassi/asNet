@@ -36,6 +36,45 @@ ws_item_vars <- function(d) grep("^mcs_vc[0-9]+_", names(d), value = TRUE)
 # mcg_v2_dog is misnamed in the NDA export (missing "c")
 wg_item_vars <- function(d) grep("^mcg_vc?[0-9]+_", names(d), value = TRUE)
 
+# ---- known column misalignments ----------------------------------------------
+# Found with the item-profile check plus a scan for runs of columns that fit the
+# neighbouring item better (see 01_prep_data.Rmd). In each run, column k holds the
+# response to item k + 1. `missing` items have no recoverable data; `ambiguous`
+# items sit at the uncertain end of the run (split halves disagree) and are set NA.
+KNOWN_SHIFTS <- list(
+  list(form = "WS", collection_id = 2024,
+       first = "mcs_vc10_31wind", last = "mcs_vc14_77slide",
+       missing = "mcs_vc10_31wind",
+       ambiguous = c("mcs_vc14_77slide", "mcs_vc14_78smile", "mcs_vc14_79spill",
+                     "mcs_vc14_80splash", "mcs_vc14_81stand"))
+)
+
+# Item variables in form order (section, then position within section)
+ws_form_order <- function(items) {
+  m <- stringr::str_match(items, "^mcs_vc([0-9]+)_([0-9]+)")
+  items[order(as.integer(m[, 2]), as.integer(m[, 3]))]
+}
+
+# Undo a known shift: for the affected rows, item j takes the value stored in the
+# column before it, for every item from first+1 to last+1.
+fix_column_shifts <- function(m, data, form, shifts = KNOWN_SHIFTS) {
+  ord <- if (form == "WS") ws_form_order(colnames(m)) else colnames(m)
+  log <- list()
+  for (s in shifts) {
+    if (s$form != form) next
+    rows <- which(as.numeric(data$collection_id) == s$collection_id)
+    a <- match(s$first, ord); b <- match(s$last, ord)
+    src <- ord[a:b]; dst <- ord[(a + 1):(b + 1)]
+    m[rows, dst] <- m[rows, src]
+    m[rows, c(s$missing, s$ambiguous)] <- NA
+    log[[length(log) + 1]] <- tibble(form = form, collection_id = s$collection_id, rows = length(rows),
+                                     first = s$first, last = s$last, shifted = length(src),
+                                     set_missing = length(unique(c(s$missing, s$ambiguous))))
+  }
+  attr(m, "shift_log") <- bind_rows(log)
+  m
+}
+
 # ---- item dictionaries -------------------------------------------------------
 
 ws_dictionary <- function(desc, items) {
@@ -420,7 +459,7 @@ item_profile_check <- function(asd, td, gross_resid = .30, max_gross_share = .02
     summarise(b0 = coef(suppressWarnings(glm(value ~ log(prod), binomial)))[1],
               b1 = coef(suppressWarnings(glm(value ~ log(prod), binomial)))[2],
               .groups = "drop")
-  d <- vocab_window(asd) %>% inner_join(ref, by = "definition") %>%
+  d <- vocab_window(asd) %>% filter(!is.na(value)) %>% inner_join(ref, by = "definition") %>%
     mutate(resid = value - plogis(b0 + b1 * log(prod)))
   split_r <- function(x) {
     ids <- unique(x$row)

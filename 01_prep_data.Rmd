@@ -53,6 +53,26 @@ stopifnot(all(dict_ws$definition %in% d_td_ws$definition))
 
 Loaded `r nrow(ws$data)` WS rows and `r nrow(wg$data)` WG rows.
 
+## Known column misalignments
+
+WS collection 2024 has an off-by-one error in its submitted item columns.
+From the "wind" column (end of Outside Things) through "slide" (Action Words), 154 columns in all, each column holds the response to the *next* item.
+It was found by the item-profile check below and located with a scan for runs of columns that fit the neighbouring item better:
+
+- The shifted reading improves the log-likelihood by 25.6 per child.
+- Two random halves of the collection's children both put the start at "wind" and the end within a few items of "slide".
+- No other collection shows a run longer than 2 columns, and none gains more than 0.5 per child.
+
+We shift those columns back. "Wind" has no recoverable response, and the five items at the uncertain end of the run (slide, smile, spill, splash, stand) are set to missing for this collection.
+The run definitions are in `KNOWN_SHIFTS` in `helper_functions/ndar_qc.R`.
+
+```{r fix-shifts}
+m_ws <- fix_column_shifts(m_ws, ws$data, "WS")
+attr(m_ws, "shift_log") %>% kable()
+shift_na <- KNOWN_SHIFTS %>% keep(~ .x$form == "WS") %>%
+  map_dfr(~ tibble(collection_id = .x$collection_id, var = c(.x$missing, .x$ambiguous)))
+```
+
 ## Response coding
 
 **WS.** The NDA data dictionary codes each item as 0 = No; 1 = Says & Understands; 2 = Understands; 3 = Says.
@@ -152,7 +172,10 @@ admins <- admins %>%
 ## Item-level data
 
 ```{r long}
-d_asd_ws <- to_long(filter(admins, form == "WS"), m_ws, dict_ws, "WS")
+d_asd_ws <- to_long(filter(admins, form == "WS"), m_ws, dict_ws, "WS") %>%
+  # items with no recoverable response after the shift fix stay missing (not "blank = no")
+  left_join(shift_na %>% mutate(.unrecoverable = TRUE), by = c("collection_id", "var")) %>%
+  mutate(value = ifelse(coalesce(.unrecoverable, FALSE), NA, value)) %>% select(-.unrecoverable)
 d_asd_wg <- to_long(filter(admins, form == "WG"), m_wg, dict_wg, "WG", wg_produce_code)
 
 add_meta <- function(d, f) d %>%
