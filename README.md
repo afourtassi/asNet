@@ -31,6 +31,7 @@ These results are from the cleaned data on the `data-cleaning-trust-scores` bran
 | `04_DIF_analysis.Rmd` | Fits a Rasch model to each group and flags items with large DIF. |
 | `05_IRT_summary.Rmd` | Summary report of the DIF and network results, built from saved outputs. |
 | `06_anchored_DIF.Rmd` | DIF against the fixed Wordbank English 2PL item bank: ASD ability on the Wordbank scale, language age, and iteratively purified anchored DIF. |
+| `07_soft_label_feasibility.Rmd` | Can the item-level profile soft-label ASD? Draft collection-level ASD priors, sex-implied ASD shares, and held-out separability of NDAR vs θ-matched Wordbank children (profile vs level). |
 | `00_investigate_missing_data.Rmd` | Exploratory notes on missing item-level data. |
 | `DATA_FIXES.md` | What the cleaning does and why, and how the fixes changed the results. |
 | `helper_functions/` | `ndar_qc.R` (QC and trust scores), `network_growth.R`, `DIF_helpers.R` and `irt_report_data.R`, plus older helpers from the original analyses. |
