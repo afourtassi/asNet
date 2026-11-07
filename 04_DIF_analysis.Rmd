@@ -1,0 +1,185 @@
+---
+title: "DIF analysis"
+author: "ASD CDI team"
+date: '2026-11-05'
+output: html_document
+params:
+  tier_A_only: false   # sensitivity check: only collections with trust tier A
+  exclude_dx_unconfirmed: false  # sensitivity check: drop collections without confirmed ASD dx (2024, 9)
+  include_flagged: false  # include collections that fail the item-profile check (WS 2024)
+  refit: false         # refit IRT models even if a cached fit exists
+---
+
+```{r setup, message=F, warning=F}
+library(tidyverse)
+library(knitr)
+library(mirt)
+library(gamlss)
+source("helper_functions/DIF_helpers.R")
+knitr::opts_chunk$set(message = F, warning = F)
+
+load("data/nda_private/cached_data.Rds") # from 01_prep_data.Rmd
+
+# IRT assumes independent respondents, so use one administration per ASD child
+# (chosen at random in 01_prep_data.Rmd; NDAR includes longitudinal data).
+asd_keep <- function(d) {
+  d <- d %>% filter(one_per_child)
+  if (params$tier_A_only) d <- d %>% filter(tier == "A")
+  if (params$exclude_dx_unconfirmed) d <- d %>% filter(!asd_dx_unconfirmed)
+  if (!params$include_flagged) d <- d %>% filter(item_profile_ok)
+  d
+}
+suffix <- paste0(if (params$tier_A_only) "_tierA" else "",
+                 if (params$exclude_dx_unconfirmed) "_dxconfirmed" else "",
+                 if (params$include_flagged) "_withflagged" else "")
+model_path <- function(form) sprintf("data/nda_private/prod%s_IRT_model%s.Rds", form, suffix)
+
+# Build TD + ASD response matrix (same item order), dropping children who produce 0 words
+build_dif_data <- function(td, asd) {
+  items <- sort(unique(td$definition))
+  stopifnot(setequal(items, unique(asd$definition)))
+  td_mat <- td %>% transmute(sid = paste0("td_", data_id), definition, value = produces) %>%
+    pivot_wider(id_cols = sid, names_from = definition, values_from = value)
+  asd_mat <- asd %>% transmute(sid = paste0("asd_", id), definition, value) %>%
+    pivot_wider(id_cols = sid, names_from = definition, values_from = value)
+  mat <- bind_rows(td_mat, asd_mat)
+  demo <- tibble(sid = mat$sid, group = ifelse(startsWith(mat$sid, "td_"), "TD", "ASD"),
+                 production = rowSums(select(mat, all_of(items)), na.rm = T))
+  keep <- demo$production > 0
+  m <- data.matrix(mat[keep, items]); rownames(m) <- mat$sid[keep]
+  list(mat = m, group = demo$group[keep], removed = count(demo[!keep, ], group))
+}
+
+fit_or_load <- function(dd, path) {
+  if (params$refit || !file.exists(path)) {
+    mod_dev_group <- fit_mod_intuitive(dd$mat, dd$group)
+    save(mod_dev_group, file = path)
+  }
+  load(path)
+  mod_dev_group
+}
+
+# Production percentiles by age (GAMLSS, beta family)
+centile_plot <- function(demo_td, demo_asd, n_items, td_ages, asd_ages) {
+  prep <- function(d) d %>% mutate(prop_produced = pmin(pmax(production / n_items, 0.001), 0.999))
+  fit <- function(d) gamlss(prop_produced ~ pbm(age, lambda = 10000),
+                            sigma.formula = ~ pbm(age, lambda = 10000),
+                            family = BE, data = d, trace = F)
+  # gamlss re-reads the fitting data by name when predicting, so pass it explicitly
+  cents <- function(d, ages) centiles.pred(fit(d), cent = c(90, 75, 50, 25, 10),
+                                           xname = "age", xvalues = ages, data = d, plot = F) %>%
+    tibble() %>% pivot_longer(2:6, names_to = "percentile", values_to = "pred") %>% rename(age = x)
+  demo_td <- prep(demo_td); demo_asd <- prep(demo_asd)
+  ct <- cents(demo_td, td_ages); ca <- cents(demo_asd, asd_ages)
+  p <- function(d, cc, title) ggplot(d, aes(x = jitter(age))) +
+    geom_point(alpha = .1, aes(y = production)) +
+    geom_line(data = cc, aes(x = age, y = pred * n_items, linetype = percentile)) +
+    theme_classic() + xlab("Age (months)") + ylab("Production Sumscore") + ggtitle(title)
+  ggpubr::ggarrange(p(demo_td, ct, "Typically-Developing"), p(demo_asd, ca, "ASD"),
+                    ncol = 2, common.legend = T)
+}
+```
+
+`r if (params$tier_A_only) "**Sensitivity analysis: tier-A collections only.**"`
+`r if (params$exclude_dx_unconfirmed) "**Sensitivity analysis: collections without confirmed ASD diagnosis excluded.**"`
+`r if (params$include_flagged) "**Sensitivity analysis: includes collections that fail the item-profile check (see 01_prep_data).**" else "Collections that fail the item-profile check in 01_prep_data (WS 2024) are excluded."`
+
+# CDI:WS Production
+
+```{r ws-data}
+wb_items <- d_td_ws %>% distinct(category, definition)
+asd_ws <- asd_keep(d_asd_ws)
+dd_ws <- build_dif_data(d_td_ws, asd_ws)
+```
+
+The ASD sample has `r n_distinct(asd_ws$GUID)` children from `r n_distinct(asd_ws$collection_id)` collections, one administration per child.
+Children producing no words were removed: `r paste(dd_ws$removed$n, dd_ws$removed$group, collapse = ", ")`.
+
+```{r ws-centiles, fig.width=9, fig.height=4, fig.cap="Production sumscores on the CDI:WS for TD vs. ASD children."}
+demo_td_ws <- d_td_ws %>% distinct(data_id, age, production)
+demo_asd_ws <- asd_ws %>% group_by(id, age) %>% summarise(production = sum(value, na.rm = T), .groups = "drop")
+centile_plot(demo_td_ws, demo_asd_ws, 680, 16:30, 12:48)
+```
+
+```{r fit-ws-model}
+mod_ws <- fit_or_load(dd_ws, model_path("WS"))
+
+mm_asd <- extract_group_df(mod_ws, groups = c("TD", "ASD"))
+mm_asd <- flag_dif(mm_asd)
+thresh <- 2 * sd(mm_asd$d_diff)
+big_dif <- mm_asd %>% filter(extreme)
+
+print(item_difficulty_difference_histogram(mm_asd, withNormal = T))
+save(mm_asd, file = sprintf("data/nda_private/dif_items_WS%s.Rds", suffix))
+```
+
+`d` is an easiness intercept, so d_ASD − d_TD < 0 means an item is harder for children with ASD than for TD children of the same overall vocabulary level.
+Each group's latent mean is fixed at 0, so the overall gap between the samples appears as a uniform shift in d_ASD − d_TD (here `r round(mean(mm_asd$d_diff), 2)`).
+We remove that shift and flag items more than 2 SD from it (|centered difference| > `r round(thresh,2)`; red dotted lines in the histogram).
+There are `r nrow(big_dif)` such items:
+
+```{r}
+big_dif <- big_dif %>% left_join(wb_items, by = "definition")
+
+big_dif %>% arrange(d_diff_c) %>%
+  relocate(category, definition) %>%
+  rename(d_TD = d_g1, d_ASD = d_g2, centered_diff = d_diff_c) %>%
+  dplyr::select(category, definition, d_TD, d_ASD, d_diff, centered_diff) %>%
+  kable(format = "html", table.attr = "style='width:50%;'", digits = 2)
+
+sort(table(big_dif$category)) %>% kable(col.names = c("Category", "Frequency"))
+```
+
+
+# CDI:WG Production
+
+```{r wg-data}
+base::load("data/eng_wg_raw_data.Rds")
+
+d_td_wg <- eng_wg %>%
+  mutate(produces = value == "produces") %>%
+  filter(!is.na(category)) %>%
+  dplyr::select(data_id, produces, age, production, category, definition)
+
+wg_items <- d_td_wg %>% distinct(category, definition)
+asd_wg <- asd_keep(d_asd_wg)
+dd_wg <- build_dif_data(d_td_wg, asd_wg)
+```
+
+The ASD sample has `r n_distinct(asd_wg$GUID)` children from `r n_distinct(asd_wg$collection_id)` collections, one administration per child.
+Children producing no words were removed: `r paste(dd_wg$removed$n, dd_wg$removed$group, collapse = ", ")`.
+
+```{r wg-centiles, fig.width=9, fig.height=4, fig.cap="Production sumscores on the CDI:WG for TD vs. ASD children."}
+demo_td_wg <- d_td_wg %>% distinct(data_id, age, production)
+demo_asd_wg <- asd_wg %>% group_by(id, age) %>% summarise(production = sum(value, na.rm = T), .groups = "drop")
+centile_plot(demo_td_wg, demo_asd_wg, 396, 8:18, 8:36)
+```
+
+```{r fit-wg-model}
+mod_wg <- fit_or_load(dd_wg, model_path("WG"))
+
+mm_asd_wg <- extract_group_df(mod_wg, groups = c("TD", "ASD"))
+mm_asd_wg <- flag_dif(mm_asd_wg)
+thresh_wg <- 2 * sd(mm_asd_wg$d_diff)
+big_dif_wg <- mm_asd_wg %>% filter(extreme)
+
+print(item_difficulty_difference_histogram(mm_asd_wg, withNormal = T))
+save(mm_asd_wg, file = sprintf("data/nda_private/dif_items_WG%s.Rds", suffix))
+```
+
+`d` is an easiness intercept, so d_ASD − d_TD < 0 means an item is harder for children with ASD than for TD children of the same overall vocabulary level.
+Each group's latent mean is fixed at 0, so the overall gap between the samples appears as a uniform shift in d_ASD − d_TD (here `r round(mean(mm_asd_wg$d_diff), 2)`).
+We remove that shift and flag items more than 2 SD from it (|centered difference| > `r round(thresh_wg,2)`; red dotted lines in the histogram).
+There are `r nrow(big_dif_wg)` such items:
+
+```{r}
+big_dif_wg <- big_dif_wg %>% left_join(wg_items, by = "definition")
+
+big_dif_wg %>% arrange(d_diff_c) %>%
+  relocate(category, definition) %>%
+  rename(d_TD = d_g1, d_ASD = d_g2, centered_diff = d_diff_c) %>%
+  dplyr::select(category, definition, d_TD, d_ASD, d_diff, centered_diff) %>%
+  kable(format = "html", table.attr = "style='width:50%;'", digits = 2)
+
+sort(table(big_dif_wg$category)) %>% kable(col.names = c("Category", "Frequency"))
+```

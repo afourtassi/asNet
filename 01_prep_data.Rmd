@@ -1,0 +1,259 @@
+---
+title: "Prep data"
+author: "ASD CDI team"
+date: '2026-11-05'
+output: html_document
+---
+
+```{r setup, message=F}
+library(tidyverse)
+library(magrittr)
+library(knitr)
+source("helper_functions/ndar_qc.R")
+knitr::opts_chunk$set(message = F, warning = F)
+```
+
+This Rmd cleans the NDAR CDI exports and writes `data/nda_private/cached_data.Rds`.
+Everything derived from NDA data goes in `data/nda_private/`, which is gitignored:
+the repo is public, and the NDA Data Use Certification forbids redistributing GUIDs or item-level data.
+
+Raw exports go in `data/ASD CDI data/` (`mci_sentences02.txt`, `mci_words_gestures01.txt`).
+The QC logic is in `helper_functions/ndar_qc.R`.
+
+# Typically-developing data (Wordbank)
+
+```{r load-wordbank-data}
+base::load("data/eng_ws_raw_data.Rds")
+
+d_td_ws <- eng_ws %>%
+  mutate(produces = value == "produces") %>%
+  filter(!is.na(category)) %>%
+  dplyr::select(data_id, produces, age, production, sex,
+                ethnicity, mom_ed, category, definition) %>%
+  mutate(form = "WS")
+```
+
+# ASD data (NDAR)
+
+```{r read-ndar}
+ws <- read_ndar("data/ASD CDI data/mci_sentences02.txt")
+wg <- read_ndar("data/ASD CDI data/mci_words_gestures01.txt")
+
+ws_items <- ws_item_vars(ws$data)  # 680 vocabulary items
+wg_items <- wg_item_vars(wg$data)  # 396 vocabulary items
+
+m_ws <- item_matrix(ws$data, ws_items)
+m_wg <- item_matrix(wg$data, wg_items)
+
+dict_ws <- ws_dictionary(ws$desc, ws_items)
+dict_wg <- wg_dictionary(wg$desc, wg_items)
+
+stopifnot(all(dict_ws$definition %in% d_td_ws$definition))
+```
+
+Loaded `r nrow(ws$data)` WS rows and `r nrow(wg$data)` WG rows.
+
+## Known column misalignments
+
+WS collection 2024 has an off-by-one error in its submitted item columns.
+From the "wind" column (end of Outside Things) through "slide" (Action Words), 154 columns in all, each column holds the response to the *next* item.
+It was found by the item-profile check below and located with a scan for runs of columns that fit the neighbouring item better:
+
+- The shifted reading improves the log-likelihood by 25.6 per child.
+- Two random halves of the collection's children both put the start at "wind" and the end within a few items of "slide".
+- No other collection shows a run longer than 2 columns, and none gains more than 0.5 per child.
+
+We shift those columns back. "Wind" has no recoverable response, and the five items at the uncertain end of the run (slide, smile, spill, splash, stand) are set to missing for this collection.
+The run definitions are in `KNOWN_SHIFTS` in `helper_functions/ndar_qc.R`.
+
+```{r fix-shifts}
+m_ws <- fix_column_shifts(m_ws, ws$data, "WS")
+attr(m_ws, "shift_log") %>% kable()
+shift_na <- KNOWN_SHIFTS %>% keep(~ .x$form == "WS") %>%
+  map_dfr(~ tibble(collection_id = .x$collection_id, var = c(.x$missing, .x$ambiguous)))
+```
+
+## Response coding
+
+**WS.** The NDA data dictionary codes each item as 0 = No; 1 = Says & Understands; 2 = Understands; 3 = Says.
+The previous version of this script scored any non-zero code as "produces", so "understands only" counted as produced.
+Now only codes 1 and 3 count as produced.
+(The stored `mcs_vc_total` matches the count of 1s.)
+
+**WG.** The data dictionary says nothing about the codes, and datasets disagree.
+Most use 1 = understands, 2 = understands & says. Some (collections 19 and 2027) use 0 = understands only, 1 = says, and 2 or blank = neither.
+For each `dataset_id`, we choose whichever code reproduces the lab's stored "words produced" total (`mcg_vc_totpr`), and whichever scheme reproduces the stored "words understood" total (`mcg_vc_totcom`): codes 1 + 2 (`understand_scheme` "12") or non-blank codes 0 + 1 ("01"):
+
+```{r wg-coding}
+wg_coding <- infer_wg_coding(wg$data, m_wg)
+wg_coding %>%
+  left_join(distinct(wg$data, dataset_id, collection_id), by = "dataset_id") %>%
+  relocate(collection_id) %>% arrange(collection_id) %>%
+  kable(digits = 2)
+
+wg_produce_code <- wg_coding$produce_code[match(wg$data$dataset_id, wg_coding$dataset_id)]
+wg_produce_code <- replace_na(wg_produce_code, 2L) # datasets w/o usable items; never kept
+wg_understand <- wg_coding$understand_scheme[match(wg$data$dataset_id, wg_coding$dataset_id)]
+wg_understand <- replace_na(wg_understand, "12")
+```
+
+## Administration-level QC
+
+Each row (one CDI administration) is checked for:
+
+- **no item data**: every vocabulary item is blank. Many collections only submitted summary scores.
+- **items zero-filled**: every item is 0 even though the lab's stored total is non-zero, or the whole dataset has no non-zero item (e.g. WG collection 1600).
+- **items disagree with stored total**: the recomputed production count misses the stored total by more than max(`r QC$total_tol_abs` words, `r 100*QC$total_tol_rel`%). A stored total of 999 is NDA's missing-value code, so those rows can't be checked.
+- **incomplete items**: fewer than `r 100*QC$min_completeness`% of items answered. One exception: some labs leave "no" answers blank, so if the answered items reproduce the stored total, blank items are scored as "no" (`blanks_as_no`).
+- **identical to another child**: an administration's response vector (with at least `r QC$clone_min_words` words produced) is identical to a different child's.
+- **duplicates**: GUID identifies a child. Within a form, several rows with the same GUID × age are the same administration:
+  - if their responses are identical, we keep one;
+  - if their responses differ, we keep the best-verified, most complete row;
+  - if no single row is best, we drop all of them ("conflicting duplicate").
+- **age out of range**: WS `r QC$age_ws[1]`–`r QC$age_ws[2]` months; WG `r QC$age_wg[1]`–`r QC$age_wg[2]` months.
+
+These decisions are made per administration, so a clean, non-duplicated child is kept even if their collection has other problems.
+
+```{r qc}
+admins <- bind_rows(
+  score_admins(ws$data, m_ws, "WS") %>% dedupe_admins(),
+  score_admins(wg$data, m_wg, "WG", wg_produce_code) %>% dedupe_admins()
+) %>%
+  group_by(form) %>% group_modify(~ pick_one_per_child(.x)) %>% ungroup()
+
+admins %>% count(form, exclusion) %>%
+  pivot_wider(names_from = form, values_from = n, values_fill = 0) %>%
+  arrange(desc(WS + WG)) %>%
+  kable(caption = "Fate of every NDAR row")
+```
+
+## Collection trust scores
+
+For each collection we compute:
+
+- **item_coverage**: share of rows with usable item-level data.
+- **verification**: share of checkable rows whose items reproduce the stored total.
+- **consistency**: 1 minus the share of child × age groups with conflicting versions.
+- **coding** (WG only): how well the inferred response coding reproduces the stored totals.
+
+**trust** is the mean of these four, with a missing verification counted as 0.5.
+Tiers: A ≥ .85, B ≥ .60, C < .60.
+Collections with no usable item data are "summary only": they have stored totals that could still be used for sumscore analyses.
+
+**uniqueness** (distinct child × age / rows) is reported but not included in the score: exact duplicates are harmless once collapsed.
+It is still a warning sign about how a collection was submitted (e.g. collection 2024).
+
+```{r trust}
+data_sources <- read_csv("data/NDA data sources.csv", show_col_types = F)
+
+trust <- collection_trust(admins, wg_coding) %>%
+  left_join(select(data_sources, collection_id, PI), by = "collection_id")
+
+trust %>%
+  select(form, collection_id, PI, rows, children, item_coverage, verification,
+         consistency, coding, uniqueness, trust, tier, kept_children, kept_admins) %>%
+  kable(digits = 2)
+```
+
+Analyses should be re-run on tier-A collections only as a sensitivity check.
+
+**Population caveats** (not captured by the score):
+
+- Collection 2024 (Vouloumanos) appears to be infant siblings of children with ASD, not diagnosed children.
+- Collection 9 (Courchesne) says normal control data would also be deposited.
+
+`asd_dx_unconfirmed` flags these collections.
+
+```{r flags}
+dx_unconfirmed <- c(2024, 9)
+admins <- admins %>%
+  left_join(select(trust, form, collection_id, trust, tier), by = c("form", "collection_id")) %>%
+  mutate(asd_dx_unconfirmed = collection_id %in% dx_unconfirmed)
+```
+
+## Item-level data
+
+```{r long}
+d_asd_ws <- to_long(filter(admins, form == "WS"), m_ws, dict_ws, "WS") %>%
+  # items with no recoverable response after the shift fix stay missing (not "blank = no")
+  left_join(shift_na %>% mutate(.unrecoverable = TRUE), by = c("collection_id", "var")) %>%
+  mutate(value = ifelse(coalesce(.unrecoverable, FALSE), NA, value)) %>% select(-.unrecoverable)
+d_asd_wg <- to_long(filter(admins, form == "WG"), m_wg, dict_wg, "WG", wg_produce_code,
+                    wg_understand)
+
+add_meta <- function(d, f) d %>%
+  left_join(admins %>% filter(form == f) %>% select(row, tier, trust, asd_dx_unconfirmed), by = "row") %>%
+  left_join(select(data_sources, collection_id, collection_title), by = "collection_id")
+d_asd_ws <- add_meta(d_asd_ws, "WS")
+d_asd_wg <- add_meta(d_asd_wg, "WG")
+```
+
+## Item-profile check
+
+The checks above can't catch a lab that mapped responses to the wrong items: totals still agree, and section totals look normal.
+This check compares each collection's item-by-item production rates with what TD children of the same vocabulary size produce (Wordbank).
+
+- Real ASD differences are modest and shared across collections.
+- A mapping error shows up as many items far off (|observed − expected| > .30) in a pattern that replicates across random halves of the collection's children.
+- A collection is flagged when more than 2% of items are that far off **and** the split-half correlation of its residual profile is above .70.
+- Flagged collections get `item_profile_ok = FALSE` and tier C: their stored sumscores may be fine, but their item-level data are not.
+
+```{r item-profile}
+base::load("data/eng_wg_raw_data.Rds")
+td_ref <- list(
+  WS = d_td_ws %>% transmute(row = data_id, definition, value = as.integer(produces)),
+  WG = eng_wg %>% filter(!is.na(category)) %>%
+    transmute(row = data_id, definition, value = as.integer(value == "produces")))
+profile <- bind_rows(
+  item_profile_check(d_asd_ws %>% filter(one_per_child), td_ref$WS) %>% mutate(form = "WS"),
+  item_profile_check(d_asd_wg %>% filter(one_per_child), td_ref$WG) %>% mutate(form = "WG"))
+
+profile %>% select(form, collection_id, profile_admins, gross_items, split_half_r,
+                   item_profile_anomaly, worst_items) %>%
+  arrange(form, desc(gross_items)) %>% kable(digits = 2)
+
+trust <- trust %>%
+  left_join(profile %>% select(form, collection_id, gross_items, split_half_r, item_profile_anomaly),
+            by = c("form", "collection_id")) %>%
+  mutate(item_profile_ok = !coalesce(item_profile_anomaly, FALSE),
+         tier = ifelse(!item_profile_ok, "C", tier)) %>%
+  select(-item_profile_anomaly)
+
+upd <- function(d, f) d %>% select(-tier) %>%
+  left_join(trust %>% filter(form == f) %>% select(collection_id, tier, item_profile_ok), by = "collection_id")
+admins <- admins %>% select(-tier) %>%
+  left_join(trust %>% select(form, collection_id, tier, item_profile_ok), by = c("form", "collection_id"))
+d_asd_ws <- upd(d_asd_ws, "WS")
+d_asd_wg <- upd(d_asd_wg, "WG")
+```
+
+Flagged: `r with(filter(trust, !item_profile_ok), paste(form, collection_id, collapse = ", "))`.
+Downstream analyses exclude flagged collections by default (`include_flagged` parameter).
+
+# Final dataset stats
+
+```{r final-stats}
+bind_rows(d_asd_ws %>% mutate(form = "WS"), d_asd_wg %>% mutate(form = "WG")) %>%
+  distinct(form, collection_id, collection_title, tier, row, GUID, one_per_child) %>%
+  group_by(form, collection_id, collection_title, tier) %>%
+  summarise(administrations = n(), children = n_distinct(GUID), .groups = "drop") %>%
+  arrange(form, desc(administrations)) %>%
+  kable()
+```
+
+```{r production-by-age, fig.width=8, fig.height=4}
+bind_rows(d_asd_ws %>% mutate(form = "WS"), d_asd_wg %>% mutate(form = "WG")) %>%
+  group_by(form, row, GUID, age, tier) %>%
+  summarise(production = sum(value, na.rm = T), .groups = "drop") %>%
+  ggplot(aes(x = age, y = production, group = GUID)) +
+  geom_line(alpha = .1) + geom_point(aes(color = tier), alpha = .3) +
+  facet_wrap(~form, scales = "free") + theme_classic() +
+  labs(x = "Age (months)", y = "Words produced")
+```
+
+# Save data
+
+```{r save}
+save(d_asd_wg, d_asd_ws, d_td_ws, admins, trust, wg_coding, profile, QC,
+     file = "data/nda_private/cached_data.Rds")
+```

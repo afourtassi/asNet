@@ -1,0 +1,364 @@
+---
+title: "WG gestures and the comprehension–production gap"
+author: "ASD CDI team"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, message=F, warning=F, echo=F}
+library(tidyverse)
+library(knitr)
+knitr::opts_chunk$set(message = F, warning = F, echo = F)
+theme_set(theme_classic(base_size = 12))
+source("helper_functions/ndar_qc.R")      # read_ndar
+source("helper_functions/wg_scores.R")
+
+cached <- new.env(); load("data/nda_private/cached_data.Rds", envir = cached)  # from 01
+cached <- as.list(cached)
+raw    <- read_ndar("data/ASD CDI data/mci_words_gestures01.txt")$data
+load("data/eng_wg_raw_data.Rds")          # eng_wg (Wordbank, 8–18 months)
+priors <- read_csv("in_files/collection_asd_priors.csv", show_col_types = FALSE)
+
+nd <- ndar_wg_scores(cached, raw); wbl <- wordbank_wg_scores(eng_wg)
+nd_s <- add_derived(nd$scores); wb_s <- add_derived(wbl$scores)
+norms <- fit_norms(wb_s)
+nd_z <- apply_norms(nd_s, norms); wb_z <- apply_norms(wb_s, norms)
+zs <- paste0("z_", names(SCORES)); names(zs) <- names(SCORES)
+B <- 1000; set.seed(2026)
+```
+
+`07` found that the word-by-word vocabulary profile separates NDAR children from Wordbank
+children but does not track autism, while overall vocabulary level for age does. Level,
+though, measures delay rather than autism. This notebook tests two Words & Gestures (WG)
+measures that are more specific to autism, using the same label-free checks:
+
+- **Gestures**, especially the 12 *First Communicative Gestures* (show, give, point, wave,
+  reach to be picked up, ...). Reduced pointing and showing are among the better-replicated
+  early signs of autism.
+- **The comprehension–production gap**, words understood given words said. In the
+  late-talk work it was the strongest single predictor. In autism, comprehension is often
+  as delayed as production, so the gap is expected to be *smaller*.
+
+Every score is normed on Wordbank English WG (`r nrow(wb_z)` children, 8–18 months) and
+oriented so that **low = the direction expected for autism**. The orientation was fixed
+before looking at NDAR.
+
+| Score | Definition |
+|---|---|
+| Words produced, words understood | Percentile for age among Wordbank children of the same month, as a z-score |
+| First communicative gestures (FCG), early gestures (FCG + games and routines), later gestures (actions, pretend play, imitation) | Same |
+| Comprehension given production (the gap) | Standardized residual of comprehension from a Wordbank regression on age and production (empirical-logit scale, splines) |
+| FCG given words and later gestures | Residual of FCG given age, production, comprehension and later gestures |
+| Later gestures given words | Residual of later gestures given age, production and comprehension |
+
+The two FCG and later-gesture residual scores ask whether a child gestures less than
+children with the *same* vocabulary. If so, the signal is beyond delay.
+
+## 1. Data
+
+### A coding fix for WG comprehension
+
+Building these scores exposed a coding error in `01`. In datasets 14747 and 16640
+(collections 19 and 2027), the lab's stored "words understood" total equals the number
+of items coded 0 or 1 for **every** child. So these datasets use 0 = understands only,
+1 = says, 2 or blank = neither. `01` had read code 2 as "understands only". That made
+most of their children's comprehension equal to their production, and gave the rest
+implausibly large comprehension. `infer_wg_coding()` now also picks the comprehension
+scheme that reproduces the stored total. Production, and every result from `03`–`07`,
+is unchanged: the rerun leaves `admins`, `d_asd_ws` and the WG `value` column identical.
+
+```{r coding}
+cached$wg_coding %>%
+  left_join(distinct(cached$admins %>% filter(form == "WG"), dataset_id, collection_id),
+            by = "dataset_id") %>%
+  semi_join(nd_s %>% distinct(collection_id), by = "collection_id") %>%
+  filter(dataset_id %in% (cached$admins %>% filter(form == "WG", one_per_child,
+                                                    item_profile_ok) %>% pull(dataset_id))) %>%
+  transmute(Collection = collection_id, Dataset = dataset_id,
+            `"Says" code` = produce_code, `Understood =` = ifelse(understand_scheme == "01",
+                                                                  "codes 0 + 1", "codes 1 + 2"),
+            `Agreement with stored comprehension` = scales::percent(
+              ifelse(understand_scheme == "01", agree_comp_01, agree_comp_12), 1)) %>%
+  arrange(Collection) %>% kable()
+```
+
+### Sample
+
+The NDAR sample is the kept WG administrations (one per child, item-profile check passed).
+Wordbank WG norms stop at 18 months, so the main analyses use children aged 8–18 months.
+Older children are scored against 18-month norms. Because gestures are near ceiling by
+18 months in Wordbank, this is conservative for them: an older child must fall below
+typical 18-month-olds.
+
+```{r sample}
+sample_tab <- nd_z %>% group_by(Collection = collection_id) %>%
+  summarise(Children = n(), `Aged 8–18` = sum(in_norm_age), `Median age` = median(age),
+            `% male` = scales::percent(mean(sex == "M"), 1),
+            male = mean(sex == "M"),
+            `Gestures scored` = scales::percent(mean(!is.na(fcg) & !is.na(later)), 1),
+            `Comprehension scored` = scales::percent(mean(comp_ok & !is.na(comp)), 1)) %>%
+  left_join(priors %>% select(Collection = collection_id, design_guess, prior), by = "Collection") %>%
+  mutate(`Sex-implied ASD share` = round(pi_from_sex(male), 2)) %>%
+  select(Collection, Design = design_guess, `Prior` = prior, everything(), -male)
+kable(sample_tab)
+```
+
+Collection 2355 has only 8 children and very low gesture scores on every section. It
+could be a coding difference, so it is shown but carries no weight in the conclusions.
+
+## 2. Norms
+
+```{r norms-plot, fig.width=10, fig.height=6}
+long_raw <- bind_rows(
+  wb_z %>% mutate(src = "Wordbank"),
+  nd_z %>% filter(in_norm_age) %>%
+    mutate(src = ifelse(collection_id %in% c(19, 2024), paste("NDAR", collection_id), "NDAR other"))) %>%
+  select(src, age_n, prod, comp, fcg, later) %>%
+  pivot_longer(c(prod, comp, fcg, later)) %>%
+  mutate(name = factor(SCORES[name], SCORES[c("prod", "comp", "fcg", "later")]))
+ggplot(long_raw, aes(age_n, value, colour = src)) +
+  stat_summary(fun = median, geom = "line", linewidth = 1) +
+  stat_summary(fun = median, geom = "point") +
+  facet_wrap(~ name, scales = "free_y", nrow = 1) +
+  scale_colour_manual(values = c(Wordbank = "grey30", `NDAR 19` = "#c0392b",
+                                 `NDAR 2024` = "#2471a3", `NDAR other` = "#d68910")) +
+  labs(x = "Age (months)", y = "Median count", colour = NULL,
+       title = "Median scores by month, ages 8–18")
+```
+
+```{r z-by-collection}
+zt <- nd_z %>% group_by(Collection = as.character(collection_id)) %>%
+  summarise(n = n(), across(all_of(unname(zs)), ~ median(.x, na.rm = TRUE))) %>%
+  bind_rows(wb_z %>% summarise(Collection = "Wordbank", n = n(),
+                               across(all_of(unname(zs)), ~ median(.x, na.rm = TRUE))))
+names(zt)[-(1:2)] <- SCORES[names(zs)]
+kable(zt, digits = 2, caption = "Median z-score by collection (all ages; negative = expected direction for autism)")
+```
+
+## 3. NDAR vs Wordbank
+
+As in `07`, a first check is how well each score separates NDAR children from Wordbank
+children: AUC = P(NDAR child scores lower than a Wordbank child). This mixes autism with
+site and cohort differences, so it is an upper bound, not evidence of an autism signal.
+
+```{r vs-wordbank}
+groups <- list(`19` = 19, `2024` = 2024, `2027` = 2027, `2368` = 2368, `2878` = 2878)
+auc_vs_wb <- function(d, v) auc_low(c(d[[v]], wb_z[[v]]), c(rep(TRUE, nrow(d)), rep(FALSE, nrow(wb_z))))
+vs_wb <- map_dfr(names(zs), function(s) {
+  v <- zs[[s]]
+  map_dfr(names(groups), function(g) {
+    d <- nd_z %>% filter(collection_id %in% groups[[g]])
+    tibble(score = SCORES[[s]], group = g,
+           `ages 8–18` = auc_vs_wb(d %>% filter(in_norm_age), v), `all ages` = auc_vs_wb(d, v))
+  })
+})
+vs_wb %>% pivot_longer(c(`ages 8–18`, `all ages`)) %>%
+  mutate(col = paste0(group, " (", name, ")")) %>%
+  filter(!(group %in% c("2027", "2368") & name == "ages 8–18")) %>%
+  select(score, col, value) %>% pivot_wider(names_from = col, values_from = value) %>%
+  rename(Score = score) %>% kable(digits = 2)
+```
+
+Collection 2368 is the clearest autism collection (82% male, sex-implied share ≈ 1), but
+almost all its children are older than 18 months. That makes its column the most direct
+check of an autism signal, though only against 18-month norms.
+
+### Within NDAR, at the same ages
+
+The 2368 column above compares 30-month-olds with 18-month norms. A cleaner contrast is
+within NDAR: 2368 against the children aged 19 months or more in collections 19 and 2027,
+who have a much lower expected ASD share. This is the comparison on which the `07` profile
+score failed (AUC .43 for ASD-heavy vs other collections).
+
+```{r within-ndar}
+older <- nd_z %>% filter(age >= 19, collection_id %in% c(19, 2027, 2368))
+older %>% group_by(Collection = collection_id) %>%
+  summarise(Children = n(), `Median age` = median(age), `% male` = scales::percent(mean(sex == "M"), 1),
+            `Words produced` = median(prod), `Words understood` = median(comp, na.rm = TRUE),
+            FCG = median(fcg, na.rm = TRUE), `Later gestures` = median(later, na.rm = TRUE)) %>%
+  kable(caption = "Children aged 19+ months (medians)")
+within <- map_dfr(names(zs), function(s) {
+  v <- zs[[s]]; x <- older %>% filter(!is.na(.data[[v]])); case <- x$collection_id == 2368
+  b <- replicate(B, { i <- c(sample(which(case), replace = TRUE), sample(which(!case), replace = TRUE))
+                      auc_low(x[[v]][i], case[i]) })
+  tibble(Score = SCORES[[s]], `AUC, 2368 vs 19 + 2027` = sprintf("%.2f [%.2f, %.2f]",
+         auc_low(x[[v]], case), quantile(b, .025), quantile(b, .975)))
+})
+kable(within)
+fcg_fit <- lm(elogit(fcg, 12) ~ age + elogit(prod, 396) + elogit(comp, 396) + elogit(later, 45) +
+                I(collection_id == 2368), older)
+fcg_coef <- summary(fcg_fit)$coefficients["I(collection_id == 2368)TRUE", ]
+```
+
+Within NDAR, a regression of FCG (empirical logit) on age, production, comprehension and
+later gestures gives 2368 a coefficient of `r sprintf("%.2f (SE %.2f, p = %.3f)", fcg_coef[1], fcg_coef[2], fcg_coef[4])`.
+Because 2368's children say far fewer words than the older children in 19 and 2027, this
+comparison extrapolates across vocabulary levels. The Wordbank residual score, which
+compares them with 18-month-olds of similar vocabulary, is the better-matched version.
+
+## 4. The sex test
+
+There are no child-level labels, so sex is used as the validation signal, as in `07`.
+If a collection's ASD share is π, with P(male | ASD) = .80 and P(male | not ASD) = .51,
+then boys are more likely to be autistic than girls by k = P(ASD | boy) − P(ASD | girl).
+For any score whose true ASD-vs-non-ASD AUC is A:
+
+AUC(boys score lower than girls) = .5 + k (A − .5) + (the ordinary sex gap in typical children).
+
+The ordinary sex gap (girls ahead) is estimated from Wordbank on the same age-normed
+scores and subtracted. That leaves an **implied ASD AUC**, A = .5 + excess / k.
+Intervals come from `r B` bootstrap resamples of children, within collection and within
+Wordbank, recomputing π from the resampled sex ratio each time.
+
+Collection 2024 (infant siblings, 49% male, π ≈ 0) gives k ≈ 0 and serves as a placebo:
+its excess should be about zero. The test itself rests on collection 19 (61% male,
+π ≈ .34, k ≈ .27) and, at all ages, collection 2027. Its power is low: with k ≈ .27 a
+score with A = .75 adds only about .07 to the boys-vs-girls AUC.
+
+```{r sex-test}
+sex_auc <- function(score, sex) auc_low(score, sex == "M")   # boys lower than girls
+sex_stats <- function(d, wb, v) {
+  base <- sex_auc(wb[[v]], wb$sex)
+  per <- d %>% filter(!is.na(.data[[v]]), sex %in% c("M", "F")) %>% group_by(collection_id) %>%
+    summarise(n = n(), auc = sex_auc(.data[[v]], sex),
+              k = sex_k(pi_from_sex(mean(sex == "M"))), .groups = "drop") %>%
+    mutate(excess = auc - base)
+  pooled_in <- per %>% filter(collection_id != 2024, !is.na(auc))
+  tibble(base = base, per = list(per),
+         A_pooled = .5 + sum(pooled_in$n * pooled_in$excess) / sum(pooled_in$n * pooled_in$k))
+}
+run_sex <- function(d_all) {
+  map_dfr(names(zs), function(s) {
+    v <- zs[[s]]
+    est <- sex_stats(d_all, wb_z, v)
+    boot <- replicate(B, {
+      db <- d_all %>% group_by(collection_id) %>% slice_sample(prop = 1, replace = TRUE) %>% ungroup()
+      wbb <- wb_z[sample(nrow(wb_z), replace = TRUE), ]
+      r <- sex_stats(db, wbb, v)
+      c(A = r$A_pooled, setNames(r$per[[1]]$excess, r$per[[1]]$collection_id))
+    })
+    per <- est$per[[1]]
+    tibble(score = SCORES[[s]], wordbank_sex_auc = est$base,
+           A = est$A_pooled, A_lo = quantile(boot["A", ], .025, na.rm = TRUE),
+           A_hi = quantile(boot["A", ], .975, na.rm = TRUE),
+           per = list(per %>% mutate(
+             lo = map_dbl(as.character(collection_id), ~ quantile(boot[.x, ], .025, na.rm = TRUE)),
+             hi = map_dbl(as.character(collection_id), ~ quantile(boot[.x, ], .975, na.rm = TRUE)))))
+  })
+}
+use <- c(19, 2024, 2027)
+sex_in  <- run_sex(nd_z %>% filter(in_norm_age, collection_id %in% c(19, 2024)))
+sex_all <- run_sex(nd_z %>% filter(collection_id %in% use))
+```
+
+```{r sex-table}
+fmt_ci <- function(x, lo, hi) sprintf("%.2f [%.2f, %.2f]", x, lo, hi)
+sex_tab <- function(r) r %>% transmute(
+  Score = score, `Wordbank boys-lower AUC` = round(wordbank_sex_auc, 2),
+  `19: excess` = map_chr(per, ~ with(filter(.x, collection_id == 19), fmt_ci(excess, lo, hi))),
+  `2024 (placebo): excess` = map_chr(per, ~ with(filter(.x, collection_id == 2024), fmt_ci(excess, lo, hi))),
+  `Implied ASD AUC` = fmt_ci(A, A_lo, A_hi))
+kable(sex_tab(sex_in), caption = "Ages 8–18 (collection 19, k ≈ .27; collection 2024 placebo)")
+kable(sex_tab(sex_all) %>% mutate(`2027: excess` = map_chr(sex_all$per, ~ with(
+  filter(.x, collection_id == 2027), fmt_ci(excess, lo, hi)))),
+  caption = "All ages, scored against norms clamped at 8–18 months (adds collection 2027)")
+```
+
+```{r sex-plot, fig.width=9, fig.height=4.5}
+bind_rows(sex_in %>% mutate(run = "Ages 8–18"), sex_all %>% mutate(run = "All ages")) %>%
+  mutate(score = factor(score, rev(SCORES))) %>%
+  ggplot(aes(A, score)) +
+  geom_vline(xintercept = .5, linetype = 2, colour = "grey50") +
+  geom_errorbarh(aes(xmin = A_lo, xmax = A_hi), height = 0) + geom_point(size = 2) +
+  facet_wrap(~ run) + coord_cartesian(xlim = c(0, 1)) +
+  labs(x = "Implied ASD-vs-non-ASD AUC (from the excess boys-vs-girls gap)", y = NULL)
+```
+
+## 5. Which first communicative gestures?
+
+For each FCG item, a Wordbank logistic regression on age, production and comprehension
+gives each NDAR child's expected probability of "sometimes" or "often". The table shows
+observed minus expected, averaged over children. A negative value means fewer NDAR
+children show the gesture than Wordbank children with the same age and vocabulary.
+
+```{r fcg-items, fig.width=9, fig.height=5}
+fcg_labels <- c("Shows (extends arm)", "Gives", "Points", "Waves bye-bye", "Arms up to be picked up",
+                "Shakes head no", "Nods yes", "Hush", "Requests (open-close hand)",
+                "Blows kisses", "Smacks lips (yum)", "Shrugs (all gone)")
+wbm <- norms$wb %>% select(data_id, age_n, el_prod, el_comp)
+wbi <- wbl$fcg_items[as.character(wbm$data_id), ]
+nd_items <- nd$fcg_items
+ndm <- nd_z %>% select(row, collection_id, age_n, el_prod, el_comp, in_norm_age, sex)
+item_res <- map_dfr(seq_along(fcg_labels), function(j) {
+  fit <- glm(y ~ splines::ns(age_n, 3) + splines::ns(el_prod, 3) + splines::ns(el_comp, 3),
+             binomial, data = wbm %>% mutate(y = wbi[, j]))
+  ndm %>% mutate(y = nd_items[, j], p = predict(fit, ndm, type = "response")) %>%
+    filter(!is.na(y), !is.na(p)) %>%
+    mutate(item = fcg_labels[j])
+})
+item_tab <- item_res %>%
+  mutate(group = case_when(collection_id == 2368 ~ "2368 (ASD, all ages)",
+                           in_norm_age & collection_id %in% c(19, 2024) ~ paste0(collection_id, " (8–18)"),
+                           collection_id == 2027 ~ "2027 (all ages)", TRUE ~ NA)) %>%
+  filter(!is.na(group)) %>%
+  group_by(item, group) %>% summarise(n = n(), diff = mean(y - p), se = sd(y - p) / sqrt(n),
+                                      .groups = "drop")
+item_tab %>% mutate(item = factor(item, rev(fcg_labels))) %>%
+  ggplot(aes(diff, item, colour = group)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+  geom_pointrange(aes(xmin = diff - 1.96 * se, xmax = diff + 1.96 * se),
+                  position = position_dodge(width = .6), size = .3) +
+  labs(x = "Observed − expected P(sometimes/often), given age and vocabulary", y = NULL, colour = NULL)
+```
+
+```{r save}
+saveRDS(list(nd_z = nd_z, vs_wb = vs_wb, sex_in = sex_in, sex_all = sex_all, item_tab = item_tab),
+        "data/nda_private/wg_gestures_gap.Rds")
+```
+
+## Findings
+
+1. **A WG comprehension coding error is fixed.** Collections 19 and 2027 use a different
+   comprehension coding (section 1). The fix changes no production data and no earlier
+   result.
+2. **First communicative gestures carry an autism-consistent signal beyond delay, in the
+   one collection where it can be seen.** Collection 2368 is 82% male, with a median age of
+   30 months and a median of 8 words. Its children show fewer first communicative gestures
+   than Wordbank children with the same vocabulary and later-gesture scores
+   (AUC ≈ .78). The most reduced gestures are pointing, showing, waving, requesting and
+   giving (each 20–36 points below expected). These are the gestures the autism literature
+   singles out.
+   In the infant cohorts with a low expected ASD share (19, 2024, 2878), the same score sits
+   at about .5 or below (.52, .43, .28). Their item deficits are smaller and less
+   consistent: collection 19 is 13 points below on pointing and 9 on showing. Collection
+   2024 is 22 below on showing but above expected on pointing. This is the contrast
+   on which the `07` vocabulary profile failed. Here it goes the right way.
+3. **The comprehension–production gap looks like an NDAR-wide difference, not an autism
+   signal.** Comprehension given production is low in most NDAR collections, including
+   the infant-sibling cohorts (AUC .58–.76). It separates 2368 from age-matched NDAR
+   children only weakly. Words understood behaves like words produced: a delay measure.
+4. **The sex test has no power here.** The implied ASD AUCs have intervals spanning most
+   of 0–1. The placebo collection 2024 shows a positive excess on several scores, so the
+   Wordbank sex gap does not transfer exactly. The test neither supports nor rules out any
+   score. It would need several collections with intermediate ASD shares.
+
+**Caveats.**
+- The signal rests on a single collection of 40 children, whose NDA description also
+  includes a non-autism developmental-delay group.
+- Those children are older than any Wordbank WG norm. The residual scores compare them
+  with 18-month-olds of similar vocabulary, so the comparison is "minimally verbal
+  autistic toddlers vs late-talking 18-month-olds", which is roughly the clinically
+  relevant contrast.
+- Collection 2355 (n = 8) has implausibly low gesture scores and is set aside.
+
+**For an ultra-short form**, the candidates are now a handful of FCG items (point, show,
+give, wave, request), read relative to a vocabulary-level score. That is "gestures less
+than their words predict", rather than any set of vocabulary words. To check it
+properly:
+- per-child labels, or more collections with older children on WG;
+- a WG norm set beyond 18 months (Wordbank's own WG data stop at 18 months);
+- the same check on the infant-sibling cohorts' later outcomes, if their WS follow-ups can
+  be linked by GUID.

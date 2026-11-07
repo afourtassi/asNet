@@ -4,3 +4,9 @@
 .Ruserdata
 mci_sentences02.txt
 mci_words_gestures01.txt
+
+# NDA data: raw exports and anything derived from them (GUIDs, item-level
+# responses) must not be pushed to this public repo (NDA Data Use Certification)
+data/ASD CDI data/
+data/nda_private/
+*.html

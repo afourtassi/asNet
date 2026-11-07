@@ -1,0 +1,10 @@
+collection_id,PI,design_guess,prior,prior_low,prior_high,basis,verified
+1856,Ellis-Weismer,toddlers recruited with an ASD diagnosis (longitudinal),0.95,0.85,1.00,"title 'Early Language Development within the Autism Spectrum'",FALSE
+2368,Swedo,"autistic disorder, non-autism developmental delay and TD groups",0.70,0.40,0.90,"NDA description: 'children with autistic disorder, non-autism developmental delay, or typical development'",FALSE
+2026,Bookheimer,ACE center with several projects; group mix unknown,0.60,0.20,0.95,"title 'Biomarkers of Developmental Trajectories and Treatment in ASD'; notes mention nonverbal school-aged children with autism",FALSE
+2664,"Newman, Rochelle",ASD vs comparison children (experimental),0.50,0.20,0.90,"title 'How Autism Affects Speech in Multitalker Environments'; no publications listed",FALSE
+2024,Vouloumanos,infant siblings of children with ASD,0.20,0.10,0.30,"title 'Divergent biases for conspecifics as early markers for ASD'; ~19% sibling recurrence",FALSE
+2355,Tager-Flusberg & Nelson,infant siblings (high and low familial likelihood),0.15,0.05,0.30,"title 'Neurobehavioral Research on Infants at Risk for Language Delay and ASD'",FALSE
+19,,unknown (median age 13 months; possibly an infant-sibling study),0.30,0.05,0.90,no title in export,FALSE
+2027,,unknown,0.50,0.05,0.95,no title in export,FALSE
+2878,,unknown (median age 10.5 months),0.30,0.05,0.90,no title in export,FALSE

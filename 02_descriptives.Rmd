@@ -1,0 +1,75 @@
+---
+title: "Descriptive analyses"
+author: "ASD CDI team"
+date: '2022-07-19'
+output: html_document
+---
+
+```{r, echo=F, message=F}
+require("tidyverse")
+require("gamlss")
+
+load("data/nda_private/cached_data.Rds") # from 01_prep_data.Rmd
+```
+
+
+## Production vs. Age
+
+```{r, echo=F, results=F, message=F, fig.cap="Production sumscores on the CDI:WS for TD vs. ASD children."}
+# Let's show ASD and TD separately
+
+demo_td <- d_td_ws %>% 
+  distinct(data_id, age, production, sex, ethnicity, mom_ed) %>% 
+  mutate(group = "TD")
+
+demo_asd <- d_asd_ws %>% rename(data_id=id) %>%
+  mutate(data_id = as.numeric(data_id),
+         group = "ASD") %>%
+  group_by(data_id, age, group) %>%
+  summarise(production = sum(value, na.rm=T), .groups = "drop")
+
+demo_td <- demo_td %>% mutate(prop_produced = production / 680) %>%
+   mutate(prop_produced = case_when(prop_produced == 0 ~ 0.001,
+                                    prop_produced == 1 ~ 0.999,
+                                    TRUE ~ prop_produced)) %>% # can't have 1 or 0
+   dplyr::select(-sex, -ethnicity, -mom_ed)
+
+demo_asd <- demo_asd %>% mutate(prop_produced = production / 680) %>%
+   mutate(prop_produced = case_when(prop_produced == 0 ~ 0.001,
+                                    prop_produced == 1 ~ 0.999,
+                                    TRUE ~ prop_produced)) # can't have 1 or 0
+
+gam_mod_td <- gamlss(prop_produced ~ pbm(age, lambda = 10000),
+                 sigma.formula = ~ pbm(age, lambda = 10000),
+                 family = BE, data = demo_td)
+
+gam_mod_asd <- gamlss(prop_produced ~ pbm(age, lambda = 10000),
+                 sigma.formula = ~ pbm(age, lambda = 10000),
+                 family = BE, data = demo_asd)
+
+cents_asd <- centiles.pred(gam_mod_asd, cent = c(90, 75, 50, 25, 10),
+                       xname = "age", xvalues = 12:60) %>%
+  tibble() %>% pivot_longer(2:6, names_to = "percentile", values_to = "pred") %>%
+  rename(age=x)
+
+
+cents_td <- centiles.pred(gam_mod_td, cent = c(90, 75, 50, 25, 10),
+                       xname = "age", xvalues = 12:36) %>%
+  tibble() %>% pivot_longer(2:6, names_to = "percentile", values_to = "pred") %>%
+  rename(age=x)
+
+p1 <- ggplot(data=demo_td, aes(x=jitter(age))) +
+  geom_point(data=demo_td, alpha=.1, aes(y=production)) + 
+  geom_line(data=cents_td, aes(x=age, y=pred * 680, linetype = percentile)) + 
+  theme_classic() + xlab("Age (months)") + ylab("Production Sumscore") +
+  ggtitle("Typically-Developing")
+
+p2 <- ggplot(data=demo_asd %>% filter(age<60), aes(x=jitter(age))) +
+  geom_point(data=demo_asd %>% filter(age<60), alpha=.1, aes(y=production)) + 
+  geom_line(data=cents_asd, aes(x=age, y=pred * 680, linetype = percentile)) + 
+  theme_classic() + xlab("Age (months)") + ylab("Production Sumscore") +
+  ggtitle("ASD")
+
+ggpubr::ggarrange(p1, p2, ncol=2, common.legend = T)
+```
+

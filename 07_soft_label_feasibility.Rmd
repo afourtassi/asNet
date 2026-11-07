@@ -1,0 +1,265 @@
+---
+title: "Soft-labeling ASD: priors and separability"
+author: "ASD CDI team"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, message=F, warning=F, echo=F}
+library(tidyverse)
+library(knitr)
+knitr::opts_chunk$set(message = F, warning = F, echo = F)
+theme_set(theme_classic(base_size = 12))
+source("helper_functions/profile_lr.R")
+
+load("data/nda_private/cached_data.Rds")   # from 01_prep_data.Rmd
+items  <- read_csv("in_files/wordbank_2pl_items.csv", show_col_types = FALSE)
+norms  <- read_csv("in_files/wordbank_2pl_ability_norms.csv", show_col_types = FALSE)
+priors <- read_csv("in_files/collection_asd_priors.csv", show_col_types = FALSE)
+```
+
+NDAR CDI exports carry no child-level diagnosis, so "ASD" in `04`/`06` means "in an
+autism-related collection". The plan is a mixture model in which each child has a
+probability of ASD, starting from their collection's study design and updated by their
+CDI profile (see the strategy notes in the session / README). This notebook does the two
+groundwork steps:
+
+1. a draft table of **collection-level ASD priors**, checked against the sex ratio;
+2. a **separability check**: given ability, how well does a single WS administration's
+   word-by-word profile separate NDAR children from Wordbank children? This is a ceiling
+   on what a profile-based soft label (or short-form screener) could achieve.
+
+## 1. Collection priors
+
+`in_files/collection_asd_priors.csv` is a first guess from collection titles and NDA
+notes. **None of it is verified**; it needs checking against the studies' publications.
+
+As an independent check, the sex ratio implies an ASD share. Assuming P(male | ASD) = .80
+(about 4:1) and P(male | not ASD) = .51:
+π = (share male − .51) / (.80 − .51), with a binomial 95% interval. Sex is deliberately
+*not* used in the priors so that it remains available to validate the soft labels later.
+
+```{r priors}
+keep <- admins %>% filter(keep_items, one_per_child, item_profile_ok)
+sex_pi <- keep %>% group_by(form, collection_id) %>%
+  summarise(n = n(), male = mean(sex == "M"), .groups = "drop") %>%
+  mutate(se = sqrt(male * (1 - male) / n),
+         pi_sex = (male - .51) / .29,
+         lo = (male - 1.96 * se - .51) / .29, hi = (male + 1.96 * se - .51) / .29,
+         across(c(pi_sex, lo, hi), ~ pmin(pmax(.x, 0), 1)))
+sex_pi %>% left_join(priors, by = "collection_id") %>%
+  transmute(Form = form, Collection = collection_id, PI, Design = design_guess, Children = n,
+            `Prior (range)` = sprintf("%.2f (%.2f–%.2f)", prior, prior_low, prior_high),
+            `% male` = scales::percent(male, 1),
+            `Sex-implied π (95% CI)` = sprintf("%.2f (%.2f–%.2f)", pi_sex, lo, hi)) %>%
+  arrange(Form, Collection) %>%
+  kable()
+```
+
+## 2. Separability of the CDI profile
+
+```{r data}
+# admins row ids are per form, so always filter by form before joining
+X_asd <- response_matrix(d_asd_ws %>% filter(one_per_child, item_profile_ok), items)
+asd_info <- tibble(row = as.integer(rownames(X_asd))) %>%
+  left_join(keep %>% filter(form == "WS") %>% select(row, collection_id, age, sex,
+                                                    asd_dx_unconfirmed), by = "row")
+td_w <- d_td_ws %>% select(data_id, definition, produces) %>%
+  pivot_wider(names_from = definition, values_from = produces)
+X_td <- as.matrix(td_w[, items$definition]) * 1
+rownames(X_td) <- td_w$data_id
+td_age <- d_td_ws %>% distinct(data_id, age) %>% slice(match(td_w$data_id, data_id)) %>% pull(age)
+```
+
+**Design.** DIF (*δ*) is estimated on one part of the NDAR WS sample with
+`anchored_dif()`, shrunk toward 0 (empirical Bayes, so noise in the estimates is not
+mistaken for signal), and used to score *held-out* NDAR children and the Wordbank WS
+children (n = `r nrow(X_td)`):
+
+- ability θ is estimated from the training run's anchor items only;
+- the score is the profile log likelihood ratio at that θ:
+  Σ log P(x | θ, *δ*) − log P(x | θ, 0);
+- each held-out NDAR child is matched to its 3 nearest Wordbank children on θ
+  (caliper 0.1), so **vocabulary level cannot drive the AUC**.
+
+Two ways of holding out: random halves (5 repeats × 2 folds) and leave-one-collection-out
+(LOCO, *δ* learned from the other collections only, which removes that collection's own
+site effects from its *δ*).
+
+```{r folds}
+set.seed(2026)
+folds <- c(
+  map(1:5, function(rep) { f <- sample(rep(1:2, length.out = nrow(X_asd)))
+    map(1:2, ~ list(type = "random", rep = rep, test = f == .x)) }) %>% flatten(),
+  map(sort(unique(asd_info$collection_id)), ~ list(type = "LOCO", rep = .x,
+                                                   test = asd_info$collection_id == .x)))
+
+ks <- c(5, 10, 20, 40, 80, 160, Inf)
+run_fold <- function(fd) {
+  tr <- anchored_dif(X_asd[!fd$test, ], items)
+  delta <- shrink_delta(tr$items); anchors <- tr$items$anchor
+  th_test <- anchor_theta(X_asd[fd$test, , drop = FALSE], items, anchors)
+  th_td <- anchor_theta(X_td, items, anchors)
+  rank_items <- order(-abs(delta))
+  scores <- map(ks, function(k) {
+    use <- seq_along(delta) %in% rank_items[seq_len(min(k, sum(delta != 0)))]
+    list(test = profile_llr(X_asd[fd$test, , drop = FALSE], items, th_test, delta, use),
+         td = profile_llr(X_td, items, th_td, delta, use))
+  })
+  m <- match_on_theta(th_test, th_td)
+  list(fd = fd, test_rows = asd_info$row[fd$test], th_test = th_test, th_td = th_td,
+       match = m, scores = scores, delta = delta)
+}
+fold_res <- map(folds, run_fold)
+save(fold_res, file = "data/nda_private/soft_label_feasibility.Rds")
+```
+
+```{r auc}
+fold_auc <- map_dfr(fold_res, function(r) {
+  has <- lengths(r$match) > 0
+  map2_dfr(r$scores, ks, function(s, k) {
+    case <- s$test[has]; ctrl <- s$td[unlist(r$match[has])]
+    tibble(type = r$fd$type, rep = r$fd$rep, k = k, n_case = sum(has),
+           auc = auc(c(case, ctrl), c(rep(TRUE, length(case)), rep(FALSE, length(ctrl)))))
+  })
+})
+fold_auc %>% group_by(type, k) %>%
+  summarise(auc_mean = mean(auc), auc_min = min(auc), auc_max = max(auc), .groups = "drop") %>%
+  mutate(k = ifelse(is.infinite(k), "all", as.character(k))) %>%
+  pivot_wider(names_from = type, values_from = c(auc_mean, auc_min, auc_max)) %>%
+  transmute(`Items used` = k,
+            `Random halves: AUC (range)` = sprintf("%.2f (%.2f–%.2f)", auc_mean_random, auc_min_random, auc_max_random),
+            `LOCO: AUC (range)` = sprintf("%.2f (%.2f–%.2f)", auc_mean_LOCO, auc_min_LOCO, auc_max_LOCO)) %>%
+  kable(caption = "Held-out NDAR vs θ-matched Wordbank children, profile LR. Items used: the k items with the largest shrunken |δ| in the training data (θ still estimated from all anchors, so this is a ceiling for a short form).")
+```
+
+```{r loco-by-collection}
+loco <- fold_auc %>% filter(type == "LOCO", is.infinite(k)) %>%
+  left_join(priors %>% select(rep = collection_id, prior), by = "rep") %>%
+  left_join(sex_pi %>% filter(form == "WS") %>% select(rep = collection_id, pi_sex), by = "rep")
+kable(loco %>% transmute(Collection = rep, Children = n_case, `AUC vs Wordbank` = round(auc, 2),
+                         `Design prior` = prior, `Sex-implied π` = round(pi_sex, 2)),
+      caption = "LOCO AUC per held-out collection. If the profile reflects ASD rather than NDAR-wide site differences, AUC should rise with the collection's ASD share.")
+```
+
+### Level vs profile
+
+For comparison, the **level** signal: ability relative to Wordbank children of the same
+age (*z* from the monthly norms), for NDAR children aged 16–30 months.
+
+```{r level}
+nb <- norms %>% filter(n >= 50)
+th_all <- anchor_theta(X_asd, items, rep(TRUE, ncol(X_asd)))
+lv <- asd_info %>% mutate(theta = th_all) %>% filter(age >= 16, age <= 30) %>%
+  mutate(z = (theta - approx(nb$age, nb$mean, age)$y) / approx(nb$age, nb$sd, age)$y)
+th_td_all <- anchor_theta(X_td, items, rep(TRUE, ncol(X_td)))
+z_td <- (th_td_all - approx(nb$age, nb$mean, td_age)$y) / approx(nb$age, nb$sd, td_age)$y
+level_auc <- lv %>% group_by(dx_unconfirmed = asd_dx_unconfirmed) %>%
+  summarise(n = n(), auc = auc(c(-z, -z_td), c(rep(TRUE, n()), rep(FALSE, length(z_td)))))
+kable(level_auc, digits = 2, col.names = c("Dx unconfirmed (2024)", "NDAR children 16–30 mo", "AUC: low ability for age"))
+```
+
+### Does the profile score separate NDAR collections by ASD share?
+
+A within-NDAR test that does not involve Wordbank: using each child's LOCO score (δ learned
+without their collection), compare the infant-sibling collection 2024 with the collections
+recruited for ASD, matched on θ. If the profile carries ASD signal, 2024 should score lower.
+
+```{r within}
+loco_scores <- map_dfr(keep(fold_res, ~ .x$fd$type == "LOCO"), ~ tibble(
+  row = .x$test_rows, theta = .x$th_test, llr = .x$scores[[length(ks)]]$test)) %>%
+  left_join(asd_info, by = "row")
+sib <- loco_scores %>% filter(asd_dx_unconfirmed); oth <- loco_scores %>% filter(!asd_dx_unconfirmed)
+m <- match_on_theta(oth$theta, sib$theta, k = 1, caliper = .15)
+has <- lengths(m) > 0
+within_auc <- auc(c(oth$llr[has], sib$llr[unlist(m[has])]),
+                  c(rep(TRUE, sum(has)), rep(FALSE, sum(has))))
+ggplot(loco_scores, aes(theta, llr, colour = factor(collection_id))) +
+  geom_point(alpha = .6) + geom_smooth(se = FALSE, method = "loess", span = 1) +
+  labs(x = "Ability (θ)", y = "Profile log LR (LOCO)", colour = "Collection",
+       subtitle = sprintf("θ-matched AUC, ASD-recruited collections vs 2024: %.2f (%d pairs)",
+                          within_auc, sum(has)))
+```
+
+### By ability
+
+```{r by-theta, fig.width=7, fig.height=4}
+map_dfr(keep(fold_res, ~ .x$fd$type == "random"), function(r) {
+  has <- lengths(r$match) > 0; s <- r$scores[[length(ks)]]
+  tibble(theta = c(r$th_test[has], r$th_td[unlist(r$match[has])]),
+         llr = c(s$test[has], s$td[unlist(r$match[has])]),
+         case = rep(c(TRUE, FALSE), c(sum(has), length(unlist(r$match[has])))))
+}) %>%
+  mutate(bin = cut(theta, c(-Inf, -1.5, -.5, .5, 1.5, Inf))) %>%
+  group_by(bin) %>% summarise(n_case = sum(case), auc = auc(llr, case)) %>%
+  ggplot(aes(bin, auc)) + geom_col(fill = "#2471a3") +
+  geom_text(aes(label = paste0("n=", n_case)), vjust = -.3, size = 3) +
+  geom_hline(yintercept = .5, linetype = "dashed") + coord_cartesian(ylim = c(.4, 1)) +
+  labs(x = "Ability bin (θ)", y = "AUC (random halves, all items)")
+```
+
+### Does the profile score track sex?
+
+Autism is about 4:1 male, so if the profile score carries ASD signal, boys should score
+higher than girls within NDAR. Sex is not used anywhere in the score.
+
+```{r sex-check}
+heavy <- sex_pi %>% filter(form == "WS", pi_sex >= .5) %>% pull(collection_id)
+sex_auc <- tibble(
+  Comparison = c("Boys vs girls, all NDAR WS (LOCO scores)",
+                 "Boys vs girls, ASD-recruited collections only",
+                 sprintf("ASD-heavy collections (sex-implied π ≥ .5: %s) vs the rest",
+                         paste(heavy, collapse = ", "))),
+  AUC = c(auc(loco_scores$llr, loco_scores$sex == "M"),
+          with(filter(loco_scores, !asd_dx_unconfirmed), auc(llr, sex == "M")),
+          auc(loco_scores$llr, loco_scores$collection_id %in% heavy)))
+kable(sex_auc, digits = 2)
+loco_scores %>% group_by(Collection = collection_id) %>%
+  summarise(Children = n(), `Mean profile log LR` = mean(llr)) %>%
+  left_join(sex_pi %>% filter(form == "WS") %>% select(Collection = collection_id, `Sex-implied π` = pi_sex),
+            by = "Collection") %>%
+  kable(digits = 2)
+```
+
+## Findings
+
+- **Profile vs Wordbank: strong.** At matched ability, the word-by-word profile separates
+  held-out NDAR children from Wordbank children with AUC
+  `r sprintf("%.2f", mean(filter(fold_auc, type == "random", is.infinite(k))$auc))`
+  (random halves) and `r sprintf("%.2f", mean(filter(fold_auc, type == "LOCO", is.infinite(k))$auc))`
+  (leave-one-collection-out). 20 items already give about .80.
+- **But it does not track ASD.** If the profile reflected autism, it should be strongest in
+  the collections with the most autistic children and weakest in the infant-sibling
+  collection. Instead:
+  - the held-out AUC is *lowest* for 1856 (recruited for ASD, 87% male) and high for
+    2024 (siblings, 52% male);
+  - within NDAR, the ASD-recruited collections barely separate from 2024 at matched
+    ability (AUC `r sprintf("%.2f", within_auc)`);
+  - boys and girls score almost the same (AUC `r sprintf("%.2f", sex_auc$AUC[1])`).
+- **Level does track ASD.** Low ability for age separates NDAR children from Wordbank with
+  AUC `r sprintf("%.2f", level_auc$auc[!level_auc$dx_unconfirmed])` in the ASD-recruited
+  collections and `r sprintf("%.2f", level_auc$auc[level_auc$dx_unconfirmed])` in 2024.
+
+So the item-level departures from Wordbank are mostly **NDAR-wide differences** (cohort,
+region, SES, how and when parents filled in the form), not an autism-specific profile.
+This bears on `04` and `06` too: their flagged items (drink brands, *penny*, *rocking
+chair*, clothing) are probably mostly site or cohort effects.
+
+## Implications for soft labeling
+
+- A mixture model must include a site term (NDAR vs Wordbank, possibly per collection);
+  without it, the "ASD class" will simply be "NDAR".
+- With a site term, any ASD-specific item signal has to come from contrasts *between NDAR
+  collections* with different ASD shares. That rests on 5 WS collections, and the current
+  scores show little of it. Soft labels driven by the item profile alone are unlikely to
+  be informative.
+- The usable signal is **vocabulary level for age** (and probably its growth over
+  repeated administrations), which is not specific to autism. A screener would need other
+  inputs that are more specific: WG gestures and comprehension–production gaps, the
+  sentence and grammar sections of WS, or other NDA instruments.
+- Caveat: the within-NDAR comparisons have limited power, the collection priors are
+  unverified, and the sex-implied shares for 2026 and 2664 are well below their design
+  guesses, so those collections may contain few autistic children.

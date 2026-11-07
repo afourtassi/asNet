@@ -1,0 +1,284 @@
+---
+title: "Investigate Missing Data"
+author: "George"
+date: "2022-10-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(magrittr)
+library(knitr)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## NDAR Words & Sentences Data
+
+```{r load-and-summarize-ws-data}
+data_AS_WS <- read.delim("data/ASD CDI data/mci_sentences02.txt", 
+                         header = TRUE, sep = "\t", dec = ".")
+
+# extracting first row as a descriptive dataframe
+description_WS <- data_AS_WS[1:1,]
+description_WS <- as.data.frame(t(description_WS))
+names(description_WS) <- "description"
+
+# what we get rid of:
+eliminated_WS <- data_AS_WS %>%
+  dplyr::select(c(701:709,780:850)) %>%
+  slice(1:1) %>%
+  gather(key = "Column names", value = "Description")#%>%
+  #head(10)
+
+# grammar items (past tense, future, not present, etc.)
+#description_WS[701:709,]
+# complexity and examples (e.g. longest sentences)
+#description_WS[780:850,]
+
+#using mci_sentences02_id	as a distinctive id and The NDAR Global Unique Identifier 
+data_raw_AS_WS <- data_AS_WS %>%
+  dplyr::select(c("mci_sentences02_id","subjectkey","interview_age", 
+                  "collection_id", "dataset_id", "interview_date", 
+                  "src_subject_id", "sex", 21:779)) %>% # starting from 785 is complexity. we kept vocabs, word endings, word forms.
+  dplyr::select(-(689:697))
+  #dplyr::select(-(684:692)) # before adding interview_age -> sex...
+
+colnames(data_raw_AS_WS) <- as.character(unlist(data_raw_AS_WS[1,])) #unlist the row
+data_raw_AS_WS = data_raw_AS_WS[-1, ]
+
+data_raw_AS_WS <- data_raw_AS_WS %>%
+  rename(id = "mci_sentences02_id",
+         GUID = "The NDAR Global Unique Identifier (GUID) for research subject", 
+         age = "Age in months at the time of the interview/test/sampling/imaging.",
+         test_date = "Date on which the interview/genetic test/sampling/imaging/biospecimen was completed. MM/DD/YYYY",
+         src_subject_id = "Subject ID how it's defined in lab/project",
+         sex = "Sex of the subject") %>%
+  mutate(age = as.numeric(as.character(age)))
+```
+
+Loaded data from `r nrow(data_AS_WS)` subjects.
+Which of these have mcs_vc_total=="999"? 
+(A code often used in SPSS for missing data.)
+We show this below by collection_id:
+
+```{r nines}
+nnn <- subset(data_AS_WS, mcs_vc_total=="999")
+nnn %>% group_by(collection_id) %>% 
+  summarise(n = n()) %>%
+  kable()
+```
+
+## Item-level data
+
+```{r}
+num_missing = rowSums(data_AS_WS[,21:700]=="")
+unique(unlist(data_raw_AS_WS[,21:700]))
+```
+
+
+But many of these actually have at least some item-level data:
+`r nrow(subset(nnn, mcs_vc1_4_grr!=""))` subjects with non-empty responses (0, 1, or 2) for 'grr'.
+`r nrow(subset(nnn, mcs_vc2_16duck!=""))` subjects with non-empty responses (0, 1, or 2) for 'grr'.
+`r nrow(subset(nnn, mcs_vc2_36sheep!=""))` subjects with non-empty responses (0, 1, or 2) for 'grr'.
+`r nrow(subset(nnn, mcs_vc5_21drink!=""))` subjects with non-empty responses (0, 1, or 2) for 'grr'.
+
+At least 62 subjects in collection 2024 and 4 subjects in collection 2368 have item-level data for many of the items.
+[Collection 2024](https://nda.nih.gov/edit_collection.html?id=2024)'s PI is Athena Vouloumanos, and actual enrollment is listed as 209.
+Indeed, are many redundant rows in our data. 
+Out of the `r nrow(nnn)` entries with mcs_vc_total=="999", there are only `r length(unique(nnn$subjectkey))` unique subjectkey values, and `r length(unique(nnn$src_subject_id))` unique src_subject_id entries.
+(`r nrow(nnn %>% distinct(subjectkey, interview_age))` distinct subjectkey x interview_age, so mostly not longitudinal data...)
+
+[Collection 2368](https://nda.nih.gov/edit_collection.html?id=2368)'s PI is Susan Swedo, and reported submitting 125 CDI:WS subjects (and 114 CDI:WG).
+
+
+## Empty Vocabulary Columns
+
+```{r}
+data_AS_WS$empty_voc_resp = rowSums(data_AS_WS[,21:700]=="")==680
+
+novoc <- data_AS_WS %>% filter(empty_voc_resp)
+```
+
+`r nrow(novoc)` subjects are entirely blank in their vocabulary columns.
+Below we show the number of subjects with blank vocabulary along with the total N per collection.
+
+```{r}
+blank_n <- novoc %>%
+  group_by(collection_id) %>%
+  summarise(blank_voc_n = n()) 
+
+ws_tab <- data_raw_AS_WS %>% 
+  distinct(collection_id, id, GUID, age) %>%
+  group_by(collection_id) %>%
+  summarise(total_n=n()) %>%
+  left_join(blank_n) %>%
+  arrange(total_n) 
+
+#sum(subset(ws_tab, is.na(blank_voc_n))$total_n)
+
+ws_tab %>%
+  kable()
+```
+
+Only four collections don't have any subjects with fully blank item-level vocab responses: collection IDs 2664, 1856, 2368, and 2026, with a total of 549 subjects.
+
+There are 3210 subjects in collection 2024 (Vouloumanos)...is that possible?
+5 experiments are listed, Shared Data tab doesn't even mention the CDI, and Data Expected tab only lists 100 Targeted Enrollment for the CDI (shows 0 Subjects Shared).
+There are 17 listed publications, but their abstracts don't have Ns.
+
+Looking at unique subject IDs x age in Athena's data:
+
+```{r}
+a_ws <- subset(data_AS_WS, collection_id==2024)
+length(unique(a_ws$subjectkey)) # 139 GUIDs
+length(unique(a_ws$src_subject_id)) # 137 lab IDs
+nrow(a_ws %>% distinct(src_subject_id, interview_age))
+# 510 administrations -- ~4 per subject, longitudinal
+
+nrow(a_ws %>% distinct(src_subject_id, dataset_id)) # 980 admins..
+nrow(a_ws %>% distinct(src_subject_id, dataset_id, interview_age)) # 2959
+
+table(a_ws$src_subject_id, a_ws$dataset_id)
+```
+
+
+Also, there are `r sum(data_AS_WS[,21:700]=="2")` "2" responses in vocabulary: are some of these WS administrations actually WG administrations? (Where presumably 1="understands" and 2="understands and says"?)
+
+
+How does vocab look for the four good collections?
+
+```{r}
+good_ws_col <- c(2664, 1856, 2368, 2026)
+
+good_ws_dat <- data_AS_WS %>% filter(is.element(collection_id, good_ws_col))
+
+num_missing = rowSums(good_ws_dat[,21:700]=="")
+table(num_missing)
+# only 305 subjects with no data missing; several with 600+ missing
+
+sum(good_ws_dat[,21:700]=="2") # 8 "2" responses..
+
+rowSums(apply(good_ws_dat[,21:700], 1, as.numeric))
+hist(as.numeric(good_ws_dat$mcs_vc_total)) # some 999s to remove
+
+```
+
+
+Now let's look at the WG data.
+
+# NDAR Words & Gestures Data
+
+```{r}
+data_AS_WG <- read.delim("data/ASD CDI data/mci_words_gestures01.txt", 
+                         header = TRUE, sep = "\t", dec = ".") 
+
+# extracting first row as a descriptive dataframe
+description_WG <- data_AS_WG[1:1,]
+description_WG <- as.data.frame(t(description_WG))
+names(description_WG) <- "description"
+
+# we only kept vocab 
+eliminated_WG <- data_AS_WG %>%
+  dplyr::select(c(23:58,454:520))
+
+#using mci_words_gestures01_id as a distinctive id and The NDAR Global Unique Identifier 
+
+data_raw_AS_WG <- data_AS_WG %>%
+  dplyr::select(c("collection_id","dataset_id","sex","mci_words_gestures01_id","subjectkey","interview_age", 59:453, 517))
+
+colnames(data_raw_AS_WG) <- as.character(unlist(data_raw_AS_WG[1,])) #unlist the row
+data_raw_AS_WG = data_raw_AS_WG[-1, ]
+
+# what are the duplicated
+AS_WG_duplicated <- data_raw_AS_WG[duplicated(colnames(data_raw_AS_WG))] # can call colnames 
+
+# making column names unique
+names(data_raw_AS_WG) <- make.unique(names(data_raw_AS_WG), sep="_")
+
+
+data_raw_AS_WG <- data_raw_AS_WG %>%
+  rename(id = "mci_words_gestures01_id",
+         GUID = "The NDAR Global Unique Identifier (GUID) for research subject", 
+         age = "Age in months at the time of the interview/test/sampling/imaging.",
+         house = "MacArthur Words and Gestures: Vocabulary Checklist: House",
+         sex = "Sex of the subject") %>%
+  mutate(age = as.numeric(as.character(age)))
+
+
+nnn_wg <- subset(data_AS_WG, mcg_vc_totcom=="999")
+```
+
+Loaded data from `r nrow(data_AS_WG)` subjects.
+There aren't any "999"s in mcg_vc_totcom, at least.
+But there are a lot entries with no item-level data...
+
+## Empty Vocabulary Columns
+
+```{r}
+# sum(duplicated(data_AS_WG[,59:517])) # just the vocab columns
+# 7089 -- but are all of these just empty?
+data_AS_WG$empty_voc_resp = rowSums(data_AS_WG[,59:517]=="")==459
+
+novoc <- data_AS_WG %>% filter(empty_voc_resp)
+```
+
+`r nrow(novoc)` subjects are entirely blank in their vocabulary columns.
+Below we show the number of subjects with blank vocabulary along with the total N per collection.
+
+```{r}
+blank_n <- novoc %>%
+  group_by(collection_id) %>%
+  summarise(blank_voc_n = n()) 
+
+wg_tab <- data_raw_AS_WG %>% 
+  distinct(collection_id, id, GUID, age) %>%
+  group_by(collection_id) %>%
+  summarise(total_n=n()) %>%
+  left_join(blank_n) %>%
+  arrange(total_n) 
+  
+#sum(subset(wg_tab, is.na(blank_voc_n))$total_n)
+
+wg_tab %>%
+  kable()
+```
+
+Eight collections don't have any missing item-level vocabulary data, and have a total of 2814 subjects.
+
+Athena's WG subjects:
+
+```{r}
+a_wg <- subset(data_AS_WG, collection_id==2024) # 1957
+length(unique(a_wg$subjectkey)) # 143 GUIDs
+length(unique(a_wg$src_subject_id)) # 137 lab IDs
+nrow(a_wg %>% distinct(src_subject_id, interview_age)) # 261
+nrow(a_wg %>% distinct(subjectkey, interview_age)) # 265
+# 261 - 2 administrations per subject?
+
+a_wg %>% distinct(src_subject_id, interview_age) %>%
+  arrange(src_subject_id)
+
+# yet none of these 1957 rows are duplicates:
+sum(duplicated(a_wg))
+sum(duplicated(a_wg[9:528])) # 1672
+
+sum(duplicated(a_ws)) # nor in WS
+sum(duplicated(a_ws[9:854])) # but 2458 if you ignore the first several columns..
+
+
+sum(duplicated(a_ws[20:854]))
+
+length(intersect(a_wg$subjectkey, a_ws$subjectkey)) # 128 have WG and WS
+length(intersect(a_wg$src_subject_id, a_ws$src_subject_id))
+```
+
+```{r}
+wg_id_dataset_age = table(a_wg$subjectkey, a_wg$dataset_id, a_wg$interview_age)
+wg_id_dataset_age[which(wg_id_dataset_age>1)] # 178 appear twice
+
+# GUIDs that appear more than once per dataset and age
+ws_id_dataset_age = table(a_ws$subjectkey, a_ws$dataset_id, a_ws$interview_age)
+ws_id_dataset_age[which(ws_id_dataset_age>1)] # 250 appear twice
+```
+

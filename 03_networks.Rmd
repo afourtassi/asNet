@@ -1,0 +1,213 @@
+---
+title: "Networks: do semantic and phonological network structure predict word learning in ASD?"
+author: "ASD CDI team"
+date: '2026-11-05'
+output:
+  html_document:
+    toc: true
+params:
+  exclude_dx_unconfirmed: false  # sensitivity: drop collections without confirmed ASD dx (2024, 9)
+  tier_A_only: false             # sensitivity: only collections with trust tier A
+  include_flagged: false         # include collections that fail the item-profile check (WS 2024)
+---
+
+```{r setup, message=F, warning=F}
+library(tidyverse)
+library(knitr)
+library(feather)
+source("helper_functions/network_growth.R")
+knitr::opts_chunk$set(message = F, warning = F)
+theme_set(theme_classic())
+```
+
+This notebook replaces the earlier version, which depended on rwebppl, espeak and pre-QC feather caches.
+It is now built on the cleaned ASD data from `01_prep_data.Rmd`.
+
+- **Word set.** We use the 312 CDI:WS nouns with semantic and phonological network data.
+  The networks are defined over these words, so TD and ASD share the same networks.
+  The groups differ only in when they learn each word.
+- **Semantic network.** Two nouns are linked if either is a free-association response to the other (`in_files/association_cue_target.csv`).
+- **Phonological network.** Two nouns are linked if their IPA transcriptions are within edit distance 2.
+  The IPA comes from the earlier espeak run, cached in `saved_data/data_static_pred_TD.feather`.
+  It depends only on the word, not on the children.
+- **Frequency and length** come from the same file.
+
+```{r load}
+load("data/nda_private/cached_data.Rds")       # from 01_prep_data.Rmd (gitignored, NDA)
+base::load("data/eng_ws_raw_data.Rds")          # Wordbank English (American) WS
+
+words <- read_feather("saved_data/data_static_pred_TD.feather") %>%
+  filter(measure == "produces") %>%
+  distinct(definition, uni_lemma, IPA, length, frequency) %>%
+  arrange(definition)
+stopifnot(!anyDuplicated(words$definition))
+
+asd_ws <- d_asd_ws
+if (params$exclude_dx_unconfirmed) asd_ws <- asd_ws %>% filter(!asd_dx_unconfirmed)
+if (params$tier_A_only) asd_ws <- asd_ws %>% filter(tier == "A")
+if (!params$include_flagged) asd_ws <- asd_ws %>% filter(item_profile_ok)
+
+td_long <- eng_ws %>% filter(definition %in% words$definition) %>%
+  transmute(id = data_id, definition, age, produces = as.integer(produces))
+asd_long <- asd_ws %>% filter(definition %in% words$definition) %>%
+  transmute(id = row, definition, age, produces = as.integer(value))
+```
+
+`r if (params$exclude_dx_unconfirmed) "**Sensitivity analysis: collections without confirmed ASD diagnosis excluded.**"`
+`r if (params$tier_A_only) "**Sensitivity analysis: tier-A collections only.**"`
+`r if (params$include_flagged) "**Sensitivity analysis: includes collections that fail the item-profile check.**" else "Collections that fail the item-profile check in 01_prep_data (WS 2024) are excluded."`
+
+The TD sample has `r n_distinct(td_long$id)` Wordbank administrations, ages `r paste(range(td_long$age), collapse = "–")` months.
+The ASD sample has `r n_distinct(asd_long$id)` administrations from `r n_distinct(asd_ws$GUID)` children, ages `r paste(range(asd_long$age), collapse = "–")` months.
+For AoA estimation, all of a child's administrations are used: repeated measures affect the uncertainty of the logistic fit, not its point estimate.
+
+# Age of acquisition
+
+The AoA of a word is the age at which a logistic regression of P(produces) on age crosses 50%.
+
+```{r aoa}
+aoa <- bind_rows(estimate_aoa(td_long) %>% mutate(group = "TD"),
+                 estimate_aoa(asd_long) %>% mutate(group = "ASD")) %>%
+  left_join(words, by = "definition")
+
+aoa_wide <- aoa %>% select(definition, group, aoa) %>% pivot_wider(names_from = group, values_from = aoa)
+aoa %>% group_by(group) %>%
+  summarise(words = n(), min = min(aoa), median = median(aoa), max = max(aoa),
+            negative_slope = sum(slope <= 0)) %>% kable(digits = 1)
+```
+
+TD and ASD noun AoAs correlate at r = `r round(cor(aoa_wide$TD, aoa_wide$ASD), 2)` (Spearman ρ = `r round(cor(aoa_wide$TD, aoa_wide$ASD, method = "spearman"), 2)`).
+The order in which nouns are learned is largely shared, even though children with ASD learn them later.
+
+```{r aoa-scatter, fig.width=6, fig.height=5}
+ggplot(aoa_wide, aes(TD, ASD)) +
+  geom_abline(linetype = "dashed", alpha = .5) +
+  geom_smooth(method = "lm", color = "grey30") +
+  geom_point(alpha = .4) +
+  ggrepel::geom_text_repel(data = aoa_wide %>%
+                             mutate(res = resid(lm(ASD ~ TD))) %>%
+                             slice_max(abs(res), n = 14),
+                           aes(label = definition), size = 3, max.overlaps = 30) +
+  labs(x = "TD AoA (months)", y = "ASD AoA (months)")
+```
+
+Labelled points are the nouns that children with ASD learn much earlier or later than the TD ordering predicts.
+
+# Networks and static predictors
+
+```{r networks}
+cue_target <- read.csv("in_files/association_cue_target.csv", as.is = T)
+nets <- list(sem = assoc_adjacency(words$definition, words$uni_lemma, cue_target),
+             phono = phono_adjacency(words$definition, words$IPA, threshold = 2))
+
+words <- words %>% mutate(sem_deg = rowSums(nets$sem)[definition],
+                          phono_deg = rowSums(nets$phono)[definition])
+
+tibble(network = names(nets),
+       edges = map_dbl(nets, ~ sum(.x) / 2),
+       mean_degree = map_dbl(nets, ~ mean(rowSums(.x))),
+       isolates = map_dbl(nets, ~ sum(rowSums(.x) == 0))) %>% kable(digits = 2)
+```
+
+We regress AoA on semantic degree, phonological degree, log frequency and length.
+The predictors are z-scored, with missing frequency and length imputed at the mean.
+AoA is z-scored within each group, so the coefficients compare the *relative* contribution of each predictor even though ASD AoAs are later and more spread out.
+
+```{r static}
+zs <- function(x) as.numeric(scale(replace_na(x, mean(x, na.rm = T))))
+static <- aoa %>%
+  select(group, definition, aoa) %>%
+  left_join(words %>% mutate(across(c(sem_deg, phono_deg, frequency, length), zs)),
+            by = "definition") %>%
+  group_by(group) %>% mutate(aoa_z = zs(aoa)) %>% ungroup()
+
+preds <- c("sem_deg", "phono_deg", "frequency", "length")
+static_coefs <- bind_rows(
+  map_dfr(preds, function(p) static %>% group_by(group) %>%
+            group_modify(~ broom::tidy(lm(reformulate(p, "aoa_z"), data = .x), conf.int = T)) %>%
+            mutate(model = "Individual")),
+  static %>% group_by(group) %>%
+    group_modify(~ broom::tidy(lm(reformulate(preds, "aoa_z"), data = .x), conf.int = T)) %>%
+    mutate(model = "Combined")) %>%
+  ungroup() %>% filter(term != "(Intercept)")
+
+ggplot(static_coefs, aes(x = estimate, y = term, color = group, shape = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high),
+                  position = position_dodge(width = .6)) +
+  labs(x = "Effect on AoA (SD of AoA per SD of predictor)", y = NULL)
+```
+
+Do the groups differ? We fit a model on both groups with predictor × group interactions (TD = reference):
+
+```{r static-interaction}
+lm(aoa_z ~ (sem_deg + phono_deg + frequency + length) * group,
+   data = static %>% mutate(group = factor(group, c("TD", "ASD")))) %>%
+  broom::tidy(conf.int = T) %>% filter(str_detect(term, ":")) %>%
+  kable(digits = 3)
+```
+
+# Network growth models
+
+These models test *how* the lexicon grows.
+Each month, the words learned that month are treated as draws from a softmax over all not-yet-learned words.
+Each word's utility is α × predictor:
+
+- **PAC** (preferential acquisition) uses a word's degree in the full network.
+- **PAT** (preferential attachment) uses the mean degree of the already-known words it connects to.
+
+This is the likelihood the old webppl models optimized; here α is fit by maximum likelihood.
+The predictors are z-scored over the pooled TD + ASD growth data, so α is on the same scale for both groups.
+Months run from the earliest to the latest rounded AoA in each group.
+
+```{r growth}
+growth <- aoa %>% group_by(group) %>%
+  group_modify(function(x, key) {
+    am <- setNames(round(x$aoa), x$definition)
+    make_growth(am, nets, sort(unique(am)))
+  }) %>% ungroup()
+
+growth_preds <- c("sem_PAC", "sem_PAT", "phono_PAC", "phono_PAT")
+growth <- growth %>% mutate(across(all_of(growth_preds), ~ as.numeric(scale(.x))))
+
+models <- c(map(growth_preds, ~ .x) %>% setNames(growth_preds),
+            list(combined = growth_preds))
+growth_fits <- growth %>% group_by(group) %>%
+  group_modify(function(g, key)
+    imap_dfr(models, ~ fit_growth(g, .x) %>% mutate(model = .y))) %>%
+  ungroup()
+
+growth_fits %>% filter(model != "combined") %>%
+  select(group, predictor, estimate, lower, upper, mcfadden_r2) %>%
+  arrange(predictor, group) %>% kable(digits = 3, caption = "Single-predictor growth models")
+```
+
+```{r growth-plot, fig.width=7, fig.height=4}
+growth_fits %>%
+  mutate(model = ifelse(model == "combined", "Combined", "Individual")) %>%
+  ggplot(aes(x = estimate, y = predictor, color = group, shape = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
+  geom_pointrange(aes(xmin = lower, xmax = upper), position = position_dodge(width = .6)) +
+  labs(x = "α (log-odds of being learned next, per SD)", y = NULL)
+```
+
+Group differences in α (Wald z, ASD − TD):
+
+```{r growth-diff}
+growth_fits %>%
+  select(group, model, predictor, estimate, se) %>%
+  pivot_wider(names_from = group, values_from = c(estimate, se)) %>%
+  mutate(diff = estimate_ASD - estimate_TD,
+         z = diff / sqrt(se_ASD^2 + se_TD^2),
+         p = 2 * pnorm(-abs(z))) %>%
+  select(model, predictor, estimate_TD, estimate_ASD, diff, z, p) %>%
+  kable(digits = 3)
+```
+
+```{r save}
+save(aoa, words, static_coefs, growth_fits,
+     file = sprintf("data/nda_private/network_results%s%s%s.Rds",
+                    if (params$exclude_dx_unconfirmed) "_dxconfirmed" else "",
+                    if (params$tier_A_only) "_tierA" else "",
+                    if (params$include_flagged) "_withflagged" else ""))
+```

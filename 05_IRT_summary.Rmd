@@ -1,0 +1,299 @@
+---
+title: "Which CDI words differ in autism? IRT / DIF summary"
+author: "ASD CDI team"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, message=F, warning=F, echo=F}
+library(tidyverse)
+library(knitr)
+knitr::opts_chunk$set(message = F, warning = F, echo = F)
+theme_set(theme_classic(base_size = 12))
+
+# Run after 01_prep_data, 03_networks and 04_DIF_analysis (default params and
+# exclude_dx_unconfirmed = TRUE). Everything shown here is aggregate.
+load("data/nda_private/cached_data.Rds")
+load("data/eng_wg_raw_data.Rds")
+
+load_one <- function(f) { e <- new.env(); load(f, envir = e); base::get(ls(e)[1], envir = e) }
+
+cats <- bind_rows(d_td_ws %>% distinct(category, definition) %>% mutate(form = "WS"),
+                  eng_wg %>% filter(!is.na(category)) %>% distinct(category, definition) %>%
+                    mutate(form = "WG"))
+
+dif <- map_dfr(c("WS", "WG"), function(f) map_dfr(c("", "_dxconfirmed"), function(s)
+  load_one(sprintf("data/nda_private/dif_items_%s%s.Rds", f, s)) %>%
+    transmute(definition, d_TD = d_g1, d_ASD = d_g2, d_diff, d_diff_c, extreme) %>%
+    mutate(form = f, version = ifelse(s == "", "main", "dx_confirmed")))) %>%
+  left_join(cats, by = c("form", "definition")) %>%
+  mutate(category = str_replace_all(category, "_", " "))
+
+main <- dif %>% filter(version == "main")
+stat <- main %>% group_by(form) %>%
+  summarise(items = n(), r = cor(d_TD, d_ASD), flagged = sum(extreme),
+            harder = sum(extreme & d_diff_c < 0), shift = mean(d_diff), sd = sd(d_diff))
+s <- function(f, v) stat[[v]][stat$form == f]
+
+e <- new.env(); load("data/nda_private/network_results.Rds", envir = e)
+```
+
+## Main findings
+
+1. **The CDI measures much the same thing in both groups.** Item easiness correlates
+   r = `r round(s("WS","r"),2)` between TD and ASD on Words & Sentences (`r s("WS","items")` items)
+   and r = `r round(s("WG","r"),2)` on Words & Gestures (`r s("WG","items")` items).
+2. **WS:** `r s("WS","flagged")` items show large DIF, `r s("WS","harder")` of them harder for ASD,
+   mostly family/people words, drink brands, and household and clothing words.
+3. **WG:** `r s("WG","flagged")` items show large DIF. The hardest for ASD are deictic pronouns
+   and question words (*I, that, this, what, who*).
+4. **Collection 2024's WS columns were off by one item for 154 columns.** After the repair,
+   *mommy* and *daddy* are still among the largest effects, but much smaller than before
+   (see [Repairing collection 2024](#repairing-collection-2024)).
+
+## Data
+
+ASD data are the NDAR CDI exports, cleaned in `01_prep_data.Rmd` (see `DATA_FIXES.md`).
+IRT assumes independent respondents, so one randomly chosen administration per child is used.
+TD data are Wordbank English (American) norms.
+
+```{r sample}
+asd_n <- admins %>% filter(keep_items, one_per_child, item_profile_ok) %>%
+  group_by(form) %>%
+  summarise(group = "ASD (NDAR)", children = n(), collections = n_distinct(collection_id),
+            age = sprintf("%d–%d", min(age), max(age)))
+td_n <- tibble(form = c("WS", "WG"), group = "TD (Wordbank)",
+               children = c(n_distinct(d_td_ws$data_id), n_distinct(eng_wg$data_id)),
+               collections = NA,
+               age = c(paste(range(d_td_ws$age), collapse = "–"),
+                       paste(range(eng_wg$age), collapse = "–")))
+bind_rows(asd_n, td_n) %>% arrange(desc(form), group) %>%
+  kable(col.names = c("Form", "Group", "Children", "Collections", "Age (mo)"))
+
+by_coll <- admins %>% filter(keep_items, one_per_child, item_profile_ok) %>%
+  count(form, collection_id, asd_dx_unconfirmed) %>% arrange(form, desc(n))
+kable(by_coll, col.names = c("Form", "Collection", "Dx unconfirmed", "Children"),
+      caption = "Children per collection")
+```
+
+## Method
+
+A separate Rasch model is fit to each group's production data (`04_DIF_analysis.Rmd`).
+Each item gets an intercept *d*: its easiness at average ability. Each group's ability
+scale is centered at 0, so the overall vocabulary gap appears as a constant shift in
+*d*<sub>ASD</sub> − *d*<sub>TD</sub>
+(`r sprintf("%.2f", s("WS","shift"))` logits on WS, `r sprintf("%.2f", s("WG","shift"))` on WG).
+That shift is subtracted (mean–mean linking), and an item is flagged when its centered
+difference exceeds 2 SD. **Negative = harder for ASD** at the same overall vocabulary.
+
+```{r plot-fns}
+scatter_plot <- function(f) {
+  d <- main %>% filter(form == f)
+  sh <- mean(d$d_diff); k <- 2 * sd(d$d_diff)
+  ggplot(d, aes(d_TD, d_ASD)) +
+    geom_abline(intercept = sh, slope = 1, linetype = "dashed") +
+    geom_abline(intercept = sh + c(-k, k), slope = 1, alpha = .3) +
+    geom_point(aes(colour = case_when(!extreme ~ "not flagged",
+                                      d_diff_c < 0 ~ "harder for ASD",
+                                      TRUE ~ "easier for ASD")), alpha = .7) +
+    ggrepel::geom_text_repel(data = filter(d, extreme), aes(label = definition),
+                             size = 3, max.overlaps = 30) +
+    scale_colour_manual(values = c("harder for ASD" = "#c0392b", "easier for ASD" = "#2471a3",
+                                   "not flagged" = "grey75"), name = NULL) +
+    labs(x = "TD item easiness (d)", y = "ASD item easiness (d)") +
+    theme(legend.position = "bottom")
+}
+
+category_plot <- function(f) {
+  main %>% filter(form == f, !is.na(category)) %>%
+    group_by(category) %>%
+    summarise(mean_c = mean(d_diff_c), se = sd(d_diff_c) / sqrt(n()), flagged = sum(extreme)) %>%
+    ggplot(aes(reorder(category, mean_c), mean_c, fill = mean_c < 0)) +
+    geom_col() +
+    geom_errorbar(aes(ymin = mean_c - se, ymax = mean_c + se), width = .2) +
+    geom_text(aes(label = ifelse(flagged > 0, flagged, ""),
+                  y = ifelse(mean_c < 0, mean_c - se - .08, mean_c + se + .08)), size = 3) +
+    scale_fill_manual(values = c(`TRUE` = "#c0392b", `FALSE` = "#2471a3"), guide = "none") +
+    coord_flip() +
+    labs(x = NULL, y = "Mean centered DIF (± SE); labels = flagged items")
+}
+
+flagged_plot <- function(f) {
+  main %>% filter(form == f, extreme) %>%
+    ggplot(aes(reorder(paste0(definition, " (", category, ")"), d_diff_c), d_diff_c,
+               fill = d_diff_c < 0)) +
+    geom_col() +
+    scale_fill_manual(values = c(`TRUE` = "#c0392b", `FALSE` = "#2471a3"), guide = "none") +
+    coord_flip() + labs(x = NULL, y = "Centered DIF (logits)")
+}
+```
+
+## Words & Sentences
+
+```{r ws-scatter, fig.width=8, fig.height=7}
+scatter_plot("WS")
+```
+
+```{r ws-cat, fig.width=7, fig.height=6}
+category_plot("WS")
+```
+
+```{r ws-flagged, fig.width=7, fig.height=8}
+flagged_plot("WS")
+```
+
+## Words & Gestures
+
+The overall shift is large because the ASD sample is older and spans a much wider age
+range than the TD norms; centering removes it.
+
+```{r wg-scatter, fig.width=8, fig.height=7}
+scatter_plot("WG")
+```
+
+```{r wg-cat, fig.width=7, fig.height=6}
+category_plot("WG")
+```
+
+```{r wg-flagged, fig.width=7, fig.height=5}
+flagged_plot("WG")
+```
+
+## Repairing collection 2024
+
+Collection 2024 passed every row-level check, but the item-profile check in
+`01_prep_data.Rmd` found that its item-by-item rates were implausible. From *wind*
+(end of Outside Things) through *slide* (Action Words), each column held the response
+to the next item: a 154-column off-by-one shift. The shift improves fit by 25.6
+log-likelihood units per child, both random halves of the children locate it in the
+same place, and no other collection shows a run longer than 2 columns.
+
+The repair (`KNOWN_SHIFTS` in `helper_functions/ndar_qc.R`) moves each column back one
+item. *Wind* and the five uncertain items at the end of the run
+(*slide, smile, spill, splash, stand*) are set to missing for this collection.
+
+```{r c2024}
+source("helper_functions/ndar_qc.R")
+mid <- d_asd_ws %>% filter(one_per_child) %>%
+  group_by(row) %>% mutate(prod = sum(value, na.rm = TRUE)) %>% ungroup() %>%
+  filter(prod >= 150, prod <= 500)
+ord <- ws_form_order(unique(mid$var))
+words_2024 <- c("mommy*", "daddy*", "baby", "no", "bye", "pet's name", "grandpa*",
+                "nurse", "person", "cowboy")
+vars <- mid %>% distinct(var, definition) %>% filter(definition %in% words_2024) %>%
+  mutate(next_var = ord[match(var, ord) + 1])
+rate <- function(d, v) round(100 * mean(d$value[d$var == v], na.rm = TRUE))
+c24 <- filter(mid, collection_id == 2024); oth <- filter(mid, collection_id != 2024)
+# Before the repair, column `var` held what is now item `next_var`'s response.
+# Centered DIF before the repair comes from the unrepaired run (commit 0133d09).
+before_dif <- c("mommy*" = -3.90, "daddy*" = -3.38, "baby" = -2.36, "no" = -1.86,
+                "bye" = -1.80, "pet's name" = -1.73, "grandpa*" = -1.61, "nurse" = 1.43,
+                "person" = 1.48, "cowboy" = 2.31)
+vars %>% rowwise() %>%
+  mutate(raw = rate(c24, next_var), repaired = rate(c24, var), other = rate(oth, var)) %>%
+  ungroup() %>%
+  left_join(dif %>% filter(form == "WS") %>% select(definition, version, d_diff_c) %>%
+              pivot_wider(names_from = version, values_from = d_diff_c), by = "definition") %>%
+  mutate(before = before_dif[definition]) %>%
+  arrange(match(definition, words_2024)) %>%
+  transmute(Item = definition, `2024 raw %` = raw, `2024 repaired %` = repaired,
+            `Other ASD %` = other, `DIF before` = before,
+            `DIF repaired` = round(main, 2), `DIF without 2024` = round(dx_confirmed, 2)) %>%
+  kable(caption = "Production among children with 150–500 words, and centered DIF")
+```
+
+## Sensitivity: leaving out collection 2024
+
+```{r sens}
+ws <- dif %>% filter(form == "WS") %>%
+  select(definition, category, version, d_diff_c, extreme) %>%
+  pivot_wider(names_from = version, values_from = c(d_diff_c, extreme))
+n_dx <- admins %>% filter(form == "WS", keep_items, one_per_child, item_profile_ok,
+                          !asd_dx_unconfirmed) %>% nrow()
+r_sens <- cor(ws$d_diff_c_main, ws$d_diff_c_dx_confirmed)
+both <- ws %>% filter(extreme_main, extreme_dx_confirmed)
+```
+
+Collection 2024's diagnosis status is unconfirmed. Dropping it leaves `r n_dx` WS children.
+The DIF profile correlates r = `r round(r_sens, 2)` with the main analysis; that run flags
+`r sum(ws$extreme_dx_confirmed)` items, `r nrow(both)` of them also flagged in the main run.
+
+```{r sens-plot, fig.width=8, fig.height=7}
+ws %>% mutate(flag = case_when(extreme_main & extreme_dx_confirmed ~ "both",
+                               extreme_main ~ "main only",
+                               extreme_dx_confirmed ~ "without 2024 only",
+                               TRUE ~ "neither")) %>%
+  ggplot(aes(d_diff_c_main, d_diff_c_dx_confirmed, colour = flag)) +
+  geom_abline(linetype = "dashed") +
+  geom_point(alpha = .7) +
+  ggrepel::geom_text_repel(data = ~ filter(.x, flag != "neither"),
+                           aes(label = definition), size = 3, max.overlaps = 40,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = c(both = "black", `main only` = "#c0392b",
+                                 `without 2024 only` = "#2471a3", neither = "grey80"),
+                      name = "Flagged in") +
+  labs(x = "Centered DIF, main", y = "Centered DIF, without 2024") +
+  theme(legend.position = "bottom")
+```
+
+```{r robust}
+both %>% arrange(d_diff_c_main) %>%
+  transmute(Item = definition, Section = category,
+            Main = round(d_diff_c_main, 2), `Without 2024` = round(d_diff_c_dx_confirmed, 2)) %>%
+  kable(caption = "Items flagged in both analyses")
+```
+
+WG is unaffected: r = `r round(with(filter(dif, form == "WG") %>% select(definition, version, d_diff_c) %>% pivot_wider(names_from = version, values_from = d_diff_c), cor(main, dx_confirmed)), 2)` with and without the unconfirmed collections.
+
+## Network analyses on the same data
+
+From `03_networks.Rmd` (312 CDI:WS nouns).
+
+```{r aoa, fig.width=6, fig.height=6}
+aoa_w <- e$aoa %>% filter(definition %in% e$words$definition) %>%
+  select(definition, group, aoa) %>% pivot_wider(names_from = group, values_from = aoa)
+ggplot(aoa_w, aes(TD, ASD)) + geom_abline(linetype = "dashed") +
+  geom_point(alpha = .5) +
+  labs(x = "TD age of acquisition (mo)", y = "ASD age of acquisition (mo)",
+       subtitle = sprintf("r = %.2f; median AoA %.1f (ASD) vs %.1f (TD)",
+                          cor(aoa_w$TD, aoa_w$ASD, use = "complete"),
+                          median(aoa_w$ASD, na.rm = TRUE), median(aoa_w$TD, na.rm = TRUE)))
+```
+
+```{r static, fig.width=8, fig.height=4}
+e$static_coefs %>%
+  ggplot(aes(term, estimate, colour = group)) +
+  geom_hline(yintercept = 0) +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high), position = position_dodge(.4)) +
+  facet_wrap(~model) + coord_flip() +
+  labs(x = NULL, y = "Effect on standardized AoA (95% CI)", colour = NULL)
+```
+
+```{r growth}
+e$growth_fits %>%
+  select(model, predictor, group, estimate, se) %>%
+  pivot_wider(names_from = group, values_from = c(estimate, se)) %>%
+  mutate(z_diff = (estimate_ASD - estimate_TD) / sqrt(se_ASD^2 + se_TD^2),
+         p_diff = 2 * pnorm(-abs(z_diff))) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  kable(caption = "Growth models: softmax weight per predictor, and Wald test of the group difference")
+```
+
+Children with ASD learn the same nouns in nearly the same order, about 4–5 months later.
+Preferential acquisition (degree in the full network) predicts which nouns are learned next
+in both groups; preferential attachment does not; group differences are within noise.
+
+## Limitations and next steps
+
+- The 2 SD flag is descriptive. Next: likelihood-ratio DIF tests against an anchor set
+  (`mirt::DIF`) and bootstrap intervals.
+- The samples differ in age at the same vocabulary size. Next: age- or vocabulary-matched
+  TD subsamples, or age as a covariate.
+- Section-level patterns need a formal model (centered DIF ~ section or word properties).
+- Few ASD collections, and WG is dominated by collection 19. Next: leave-one-collection-out reruns.
+- The 2024 repair is inferred from the data; confirm it (and the children's diagnosis status)
+  with the submitter.
+- Rasch only. Next: check whether a 2PL changes which items are flagged.
