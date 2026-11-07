@@ -245,15 +245,26 @@ total_agrees <- function(stored, recomputed) {
 # Only 1 and 3 are production. (Checked: stored totals match count of 1s.)
 ws_produce_codes <- function() c(1L, 3L)
 
-# WG: the NDA dictionary is silent, and datasets disagree. Some use
-# 1 = understands, 2 = understands & says (standard paper form); others use
-# 1 = says (& understands), 2 = understands only. Infer per dataset_id by which
-# code count reproduces the stored "words produced" total.
+# WG: the NDA dictionary is silent, and datasets disagree. Most use
+# 1 = understands, 2 = understands & says (standard paper form). Others (collections
+# 19 and 2027) use 0 = understands only, 1 = says (& understands), 2 or blank = neither.
+# Infer per dataset_id which code count reproduces the stored "words produced" total
+# (mcg_vc_totpr), and which reproduces the stored "words understood" total (mcg_vc_totcom):
+# codes 1 + 2 (understand_scheme "12") or non-blank codes 0 + 1 ("01").
 infer_wg_coding <- function(d, m) {
   pr <- parse_total(d$mcg_vc_totpr)
   c1 <- rowSums(m == 1, na.rm = TRUE)
   c2 <- rowSums(m == 2, na.rm = TRUE)
+  c0 <- rowSums(m == 0, na.rm = TRUE)
+  co <- parse_total(d$mcg_vc_totcom)
   has_items <- rowSums(!is.na(m)) > 0 & rowSums(m > 0, na.rm = TRUE) > 0
+  comp <- tibble(dataset_id = d$dataset_id, co, c0, c1, c2, has_items) %>%
+    filter(has_items, !is.na(co)) %>%
+    group_by(dataset_id) %>%
+    summarise(n_check_comp = n(),
+              agree_comp_12 = mean(total_agrees(co, c1 + c2)),
+              agree_comp_01 = mean(total_agrees(co, c0 + c1)),
+              .groups = "drop")
   tibble(dataset_id = d$dataset_id, pr, c1, c2, has_items) %>%
     filter(has_items, !is.na(pr)) %>%
     group_by(dataset_id) %>%
@@ -263,7 +274,12 @@ infer_wg_coding <- function(d, m) {
               .groups = "drop") %>%
     mutate(produce_code = if_else(agree_code1 > agree_code2, 1L, 2L),
            coding_agreement = pmax(agree_code1, agree_code2),
-           coding_margin = abs(agree_code1 - agree_code2))
+           coding_margin = abs(agree_code1 - agree_code2)) %>%
+    left_join(comp, by = "dataset_id") %>%
+    # "01" only goes with 1 = says; with 2 = says, code 1 must mean understands
+    mutate(understand_scheme = if_else(produce_code == 1L &
+                                         coalesce(agree_comp_01, 0) > coalesce(agree_comp_12, 0),
+                                       "01", "12"))
 }
 
 # ---- administration-level QC -------------------------------------------------
@@ -485,22 +501,27 @@ item_profile_check <- function(asd, td, gross_resid = .30, max_gross_share = .02
 
 # ---- long format -------------------------------------------------------------
 
-to_long <- function(a, m, dict, form, produce_code = NULL) {
+to_long <- function(a, m, dict, form, produce_code = NULL, understand_scheme = NULL) {
   keep <- a$keep_items
   mm <- m[keep, , drop = FALSE]
   meta <- a[keep, ] %>% select(row, id, GUID, age, sex, collection_id, dataset_id,
                                one_per_child, blanks_as_no)
   pc <- if (form == "WS") NULL else produce_code[keep]
+  us <- if (form == "WS" || is.null(understand_scheme)) "12" else understand_scheme[keep]
   long <- as_tibble(mm) %>%
     mutate(row = meta$row, .pc = if (is.null(pc)) NA_integer_ else pc,
-           .bn = meta$blanks_as_no) %>%
-    pivot_longer(-c(row, .pc, .bn), names_to = "var", values_to = "code") %>%
-    mutate(code = ifelse(is.na(code) & .bn, 0L, code)) %>%
-    select(-.bn) %>%
+           .bn = meta$blanks_as_no, .us = us) %>%
+    pivot_longer(-c(row, .pc, .bn, .us), names_to = "var", values_to = "code") %>%
+    mutate(.raw = code, code = ifelse(is.na(code) & .bn, 0L, code)) %>%
     mutate(value = if (form == "WS") code %in% c(1L, 3L) else code == .pc,
            value = ifelse(is.na(code), NA, value))
-  if (form == "WG") long <- long %>% mutate(understands = ifelse(is.na(code), NA, code %in% c(1L, 2L)))
-  long %>% select(-.pc) %>%
+  # "12": understood = code 1 or 2 (blank filled as 0 = no). "01": understood = a
+  # non-blank 0 or 1; there a blank means neither, so the 0-fill must not count.
+  if (form == "WG") long <- long %>%
+    mutate(understands = case_when(is.na(code) ~ NA,
+                                   .us == "01" ~ coalesce(.raw %in% c(0L, 1L), FALSE),
+                                   TRUE ~ code %in% c(1L, 2L)))
+  long %>% select(-.pc, -.bn, -.us, -.raw) %>%
     left_join(meta, by = "row") %>%
     left_join(dict, by = "var") %>%
     relocate(id, GUID, age, sex, collection_id, dataset_id)

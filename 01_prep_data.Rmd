@@ -81,8 +81,8 @@ Now only codes 1 and 3 count as produced.
 (The stored `mcs_vc_total` matches the count of 1s.)
 
 **WG.** The data dictionary says nothing about the codes, and datasets disagree.
-Most use 1 = understands, 2 = understands & says, but some (collections 19 and 2027) use 1 = says, 2 = understands only.
-For each `dataset_id`, we choose whichever code reproduces the lab's stored "words produced" total (`mcg_vc_totpr`):
+Most use 1 = understands, 2 = understands & says. Some (collections 19 and 2027) use 0 = understands only, 1 = says, and 2 or blank = neither.
+For each `dataset_id`, we choose whichever code reproduces the lab's stored "words produced" total (`mcg_vc_totpr`), and whichever scheme reproduces the stored "words understood" total (`mcg_vc_totcom`): codes 1 + 2 (`understand_scheme` "12") or non-blank codes 0 + 1 ("01"):
 
 ```{r wg-coding}
 wg_coding <- infer_wg_coding(wg$data, m_wg)
@@ -93,6 +93,8 @@ wg_coding %>%
 
 wg_produce_code <- wg_coding$produce_code[match(wg$data$dataset_id, wg_coding$dataset_id)]
 wg_produce_code <- replace_na(wg_produce_code, 2L) # datasets w/o usable items; never kept
+wg_understand <- wg_coding$understand_scheme[match(wg$data$dataset_id, wg_coding$dataset_id)]
+wg_understand <- replace_na(wg_understand, "12")
 ```
 
 ## Administration-level QC
@@ -176,7 +178,8 @@ d_asd_ws <- to_long(filter(admins, form == "WS"), m_ws, dict_ws, "WS") %>%
   # items with no recoverable response after the shift fix stay missing (not "blank = no")
   left_join(shift_na %>% mutate(.unrecoverable = TRUE), by = c("collection_id", "var")) %>%
   mutate(value = ifelse(coalesce(.unrecoverable, FALSE), NA, value)) %>% select(-.unrecoverable)
-d_asd_wg <- to_long(filter(admins, form == "WG"), m_wg, dict_wg, "WG", wg_produce_code)
+d_asd_wg <- to_long(filter(admins, form == "WG"), m_wg, dict_wg, "WG", wg_produce_code,
+                    wg_understand)
 
 add_meta <- function(d, f) d %>%
   left_join(admins %>% filter(form == f) %>% select(row, tier, trust, asd_dx_unconfirmed), by = "row") %>%

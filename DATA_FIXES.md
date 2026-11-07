@@ -32,6 +32,7 @@ Duplicates are grouped by child × age within a form, across collections and dat
 
 - **WS:** only codes 1 and 3 count as *produces*. Code 2 means *understands only* and is no longer counted.
 - **WG:** NDA datasets disagree on whether 1 or 2 means *produces*. The coding is now inferred separately for each `dataset_id`, by checking which coding reproduces the stored totals.
+- **WG comprehension:** most datasets use 1 = understands, 2 = understands & says. Datasets 14747 and 16640 (collections 19 and 2027) instead use 0 = understands only, 1 = says, 2 or blank = neither: their stored "words understood" total equals the count of codes 0 + 1 for every child. The prep had read code 2 as "understands only" there, which made most of those children's comprehension equal to their production. `infer_wg_coding()` now also chooses, per dataset, the comprehension scheme that reproduces `mcg_vc_totcom`. Only the `understands` column changes; production and every result in `03`–`07` are identical. Found while building `08_wg_gestures_gap.Rmd`.
 - **Blank items** are treated as "no", but only when the answered items already reproduce the stored total.
 
 ### Resulting exclusions (all administrations)
